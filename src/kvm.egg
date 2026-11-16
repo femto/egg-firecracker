@@ -1,0 +1,231 @@
+// KVM through /dev/kvm (x86_64 Linux). This is the only unsafe file: the
+// rest of the VMM reaches guest memory and kvm_run through the bounds-checked
+// methods below.
+//
+// Egg has no C struct layout yet, so the KVM structs are byte buffers with
+// fields at their offsets from <linux/kvm.h>.
+uses fs, alloc
+allow unsafe
+
+extern fn open(path: *u8, flags: i32) i32 uses fs
+extern fn close(fd: i32) i32 uses fs
+// ioctl is variadic in C; every KVM request here passes one integer or
+// pointer argument, which the x86_64 calling convention passes the same way.
+extern fn ioctl(fd: i32, req: u64, arg: u64) i32 uses fs
+extern fn mmap(addr: *u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) *u8 uses alloc
+
+const O_RDWR: i32 = 2
+const O_CLOEXEC: i32 = 0x80000
+const PROT_RW: i32 = 3
+const MAP_SHARED: i32 = 0x01
+const MAP_PRIVATE: i32 = 0x02
+const MAP_ANONYMOUS: i32 = 0x20
+const MAP_NORESERVE: i32 = 0x4000
+const MAP_FAILED: usize = 18446744073709551615
+
+// ioctl numbers: _IO(0xAE, n), or _IOR/_IOW with the struct's size.
+const KVM_GET_API_VERSION: u64 = 0xAE00
+const KVM_CREATE_VM: u64 = 0xAE01
+const KVM_GET_VCPU_MMAP_SIZE: u64 = 0xAE04
+const KVM_CREATE_VCPU: u64 = 0xAE41
+const KVM_SET_USER_MEMORY_REGION: u64 = 0x4020AE46
+const KVM_RUN: u64 = 0xAE80
+const KVM_GET_REGS: u64 = 0x8090AE81
+const KVM_SET_REGS: u64 = 0x4090AE82
+const KVM_GET_SREGS: u64 = 0x8138AE83
+const KVM_SET_SREGS: u64 = 0x4138AE84
+
+const KVM_API_VERSION: i32 = 12
+const REGS_SIZE = 144     // struct kvm_regs: 18 u64
+const SREGS_SIZE = 312    // struct kvm_sregs
+
+// kvm_run->exit_reason
+const EXIT_IO = 2
+const EXIT_HLT = 5
+const EXIT_SHUTDOWN = 8
+const EXIT_FAIL_ENTRY = 9
+const EXIT_INTERNAL_ERROR = 17
+
+// kvm_regs, as indexes of u64
+const RAX = 0
+const RBX = 1
+const RIP = 16
+const RFLAGS = 17
+
+fn le(b: []u8, off: i64, n: i64) u64 {
+    var v: u64 = 0
+    var i = n - 1
+    while (i >= 0) {
+        v = (v << 8) | @as(u64, b[off + i])
+        i = i - 1
+    }
+    return v
+}
+
+fn put_le(inout b: []u8, off: i64, n: i64, v: u64) void {
+    var x = v
+    var i = 0
+    while (i < n) {
+        b[off + i] = @as(u8, x & 0xff)
+        x = x >> 8
+        i = i + 1
+    }
+}
+
+fn sys(r: i32) !i32 {
+    if (r < 0) {
+        return error.KvmFailed
+    }
+    return r
+}
+
+fn map(len: i64, prot: i32, flags: i32, fd: i32) !*u8 {
+    const p = mmap(null, @as(usize, len), prot, flags, fd, 0)
+    if (@intFromPtr(p) == MAP_FAILED) {
+        return error.MmapFailed
+    }
+    return p
+}
+
+const Kvm = struct {
+    fd: i32
+
+    fn init(a: Allocator) !Kvm {
+        const fd = try sys(open(a.cstr("/dev/kvm"), O_RDWR | O_CLOEXEC))
+        const kvm = Kvm{ .fd = fd }
+        if (try sys(ioctl(fd, KVM_GET_API_VERSION, 0)) != KVM_API_VERSION) {
+            return error.KvmApiVersion
+        }
+        return kvm
+    }
+
+    fn create_vm(self: Kvm) !Vm {
+        const fd = try sys(ioctl(self.fd, KVM_CREATE_VM, 0))
+        return Vm{ .fd = fd, .kvm = self.fd }
+    }
+}
+
+const Vm = struct {
+    fd: i32
+    kvm: i32
+
+    // Anonymous memory of size bytes, seen by the guest at gpa.
+    fn add_memory(self: Vm, a: Allocator, slot: u32, gpa: u64, size: i64) !GuestMemory {
+        const p = try map(size, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1)
+        // struct kvm_userspace_memory_region: slot, flags, gpa, size, host address
+        var region = a.alloc(32, @as(u8, 0))
+        defer a.free(region)
+        put_le(&region[0..], 0, 4, @as(u64, slot))
+        put_le(&region[0..], 8, 8, gpa)
+        put_le(&region[0..], 16, 8, @as(u64, size))
+        put_le(&region[0..], 24, 8, @as(u64, @intFromPtr(p)))
+        _ = try sys(ioctl(self.fd, KVM_SET_USER_MEMORY_REGION, @as(u64, @intFromPtr(@bufPtr(region)))))
+        return GuestMemory{ .base = p, .gpa = gpa, .size = size }
+    }
+
+    fn create_vcpu(self: Vm, id: u64) !Vcpu {
+        const fd = try sys(ioctl(self.fd, KVM_CREATE_VCPU, id))
+        const size = try sys(ioctl(self.kvm, KVM_GET_VCPU_MMAP_SIZE, 0))
+        const run = try map(@as(i64, size), PROT_RW, MAP_SHARED, fd)
+        return Vcpu{ .fd = fd, .run_page = run, .run_size = @as(i64, size) }
+    }
+}
+
+const GuestMemory = struct {
+    base: *u8
+    gpa: u64
+    size: i64
+
+    fn offset(self: GuestMemory, addr: u64, n: i64) i64 {
+        const off = @as(i64, addr - self.gpa)
+        if (addr < self.gpa or n < 0 or off > self.size - n) {
+            return -1
+        }
+        return off
+    }
+
+    // Copies bytes into guest memory at guest physical address addr.
+    fn write(self: GuestMemory, addr: u64, bytes: []u8) !void {
+        const off = self.offset(addr, @len(bytes))
+        if (off < 0) {
+            return error.OutOfGuestMemory
+        }
+        var i = 0
+        while (i < @len(bytes)) {
+            @ptrAdd(self.base, off + i).* = bytes[i]
+            i = i + 1
+        }
+    }
+
+    fn read_u8(self: GuestMemory, addr: u64) !u8 {
+        const off = self.offset(addr, 1)
+        if (off < 0) {
+            return error.OutOfGuestMemory
+        }
+        return @ptrAdd(self.base, off).*
+    }
+}
+
+// Why KVM_RUN returned, from the vCPU's kvm_run page.
+const Exit = struct {
+    reason: i64
+    // KVM_EXIT_IO
+    out: bool
+    size: i64
+    port: i64
+    count: i64
+    data: u64     // the first byte(s) written, for an out of up to 8 bytes
+}
+
+const Vcpu = struct {
+    fd: i32
+    run_page: *u8
+    run_size: i64
+
+    fn get_regs(self: Vcpu, a: Allocator) !Buf(u8) {
+        const b = a.alloc(REGS_SIZE, @as(u8, 0))
+        errdefer a.free(b)
+        _ = try sys(ioctl(self.fd, KVM_GET_REGS, @as(u64, @intFromPtr(@bufPtr(b)))))
+        return b
+    }
+
+    fn set_regs(self: Vcpu, regs: Buf(u8)) !void {
+        _ = try sys(ioctl(self.fd, KVM_SET_REGS, @as(u64, @intFromPtr(@bufPtr(regs)))))
+    }
+
+    fn get_sregs(self: Vcpu, a: Allocator) !Buf(u8) {
+        const b = a.alloc(SREGS_SIZE, @as(u8, 0))
+        errdefer a.free(b)
+        _ = try sys(ioctl(self.fd, KVM_GET_SREGS, @as(u64, @intFromPtr(@bufPtr(b)))))
+        return b
+    }
+
+    fn set_sregs(self: Vcpu, sregs: Buf(u8)) !void {
+        _ = try sys(ioctl(self.fd, KVM_SET_SREGS, @as(u64, @intFromPtr(@bufPtr(sregs)))))
+    }
+
+    fn run(self: Vcpu) !Exit {
+        _ = try sys(ioctl(self.fd, KVM_RUN, 0))
+        const r = @sliceFromPtr(self.run_page, self.run_size)
+        // struct kvm_run: exit_reason at 8; the io member of its union at 32
+        // (direction, size, port, count, data_offset).
+        const reason = @as(i64, le(r, 8, 4))
+        if (reason != EXIT_IO) {
+            return Exit{ .reason = reason, .out = false, .size = 0, .port = 0, .count = 0, .data = 0 }
+        }
+        const size = @as(i64, le(r, 33, 1))
+        const data_offset = @as(i64, le(r, 40, 8))
+        var data: u64 = 0
+        if (size <= 8 and data_offset >= 0 and data_offset <= self.run_size - size) {
+            data = le(r, data_offset, size)
+        }
+        return Exit{
+            .reason = reason,
+            .out = le(r, 32, 1) == 1,
+            .size = size,
+            .port = @as(i64, le(r, 34, 2)),
+            .count = @as(i64, le(r, 36, 4)),
+            .data = data,
+        }
+    }
+}

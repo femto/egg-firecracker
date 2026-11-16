@@ -1,0 +1,70 @@
+// Stage 0: run 12 bytes of real-mode code in a KVM guest. The guest adds
+// two registers the host set, writes the sum and a newline to the serial
+// port 0x3f8, and halts; every out is a VM exit the host prints.
+uses io, fs, alloc
+const kvm = @import("kvm.egg")
+
+const GUEST_ADDR: u64 = 0x1000
+const SERIAL_PORT = 0x3f8
+
+fn main(io: Io, files: Fs, a: Allocator) void {
+    run(io, files, a) catch |e| {
+        io.eprint("firecracker: ", @errorName(e))
+    }
+}
+
+fn run(io: Io, files: Fs, a: Allocator) !void {
+    const k = try kvm.Kvm.init(a)
+    const vm = try k.create_vm()
+    const mem = try vm.add_memory(a, 0, GUEST_ADDR, 0x1000)
+
+    const code = [12]u8{
+        0xba, 0xf8, 0x03, // mov $0x3f8, %dx
+        0x00, 0xd8,       // add %bl, %al
+        0x04, '0',        // add $'0', %al
+        0xee,             // out %al, (%dx)
+        0xb0, '\n',       // mov $'\n', %al
+        0xee,             // out %al, (%dx)
+        0xf4,             // hlt
+    }
+    try mem.write(GUEST_ADDR, code[0..])
+
+    const vcpu = try vm.create_vcpu(0)
+
+    // Real mode, with cs based at 0 so cs:ip is the guest address.
+    // struct kvm_sregs starts with cs: base (u64) at 0, selector (u16) at 12.
+    var sregs = try vcpu.get_sregs(a)
+    defer a.free(sregs)
+    kvm.put_le(&sregs[0..], 0, 8, 0)
+    kvm.put_le(&sregs[0..], 12, 2, 0)
+    try vcpu.set_sregs(sregs)
+
+    var regs = a.alloc(kvm.REGS_SIZE, @as(u8, 0))
+    defer a.free(regs)
+    kvm.put_le(&regs[0..], kvm.RIP * 8, 8, GUEST_ADDR)
+    kvm.put_le(&regs[0..], kvm.RAX * 8, 8, 2)
+    kvm.put_le(&regs[0..], kvm.RBX * 8, 8, 3)
+    kvm.put_le(&regs[0..], kvm.RFLAGS * 8, 8, 0x2)   // bit 1 is always set
+    try vcpu.set_regs(regs)
+
+    var line = Buf(u8).empty
+    defer a.free(line)
+    while (true) {
+        const exit = try vcpu.run()
+        if (exit.reason == kvm.EXIT_HLT) {
+            io.print("guest halted")
+            return
+        } else if (exit.reason == kvm.EXIT_IO and exit.out and exit.port == SERIAL_PORT and exit.size == 1) {
+            const c = @as(u8, exit.data)
+            if (c == '\n') {
+                io.print("guest: ", line)
+                a.resize(&line, 0, 0)
+            } else {
+                a.push(&line, c)
+            }
+        } else {
+            io.eprint("unhandled exit ", exit.reason, " port ", exit.port)
+            return error.UnhandledExit
+        }
+    }
+}
