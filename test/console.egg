@@ -28,8 +28,9 @@ fn main(io: Io, a: Allocator) !void {
     const vcpu = kvm.Vcpu{ .fd = -1, .run_page = @bufPtr(page), .run_size = PAGE }
     try console.out(io, a, &uart, &line, vcpu, out_exit(3))
 
-    // 4000 bytes in one exit and 100 in another, no newline: the line is
-    // printed at 4096 bytes, and 4 are kept.
+    // 4000 bytes, then 96, then 4, with no newline: the line is printed as
+    // its 4096th byte arrives (none kept then, not on the 4097th), and the
+    // next 4 are kept.
     var i = 0
     while (i < 4000) {
         @ptrAdd(@bufPtr(page), DATA + i).* = 'x'
@@ -37,7 +38,9 @@ fn main(io: Io, a: Allocator) !void {
     }
     try console.out(io, a, &uart, &line, vcpu, out_exit(4000))
     io.print("kept ", @len(line))
-    try console.out(io, a, &uart, &line, vcpu, out_exit(100))
+    try console.out(io, a, &uart, &line, vcpu, out_exit(96))
+    io.print("kept ", @len(line))
+    try console.out(io, a, &uart, &line, vcpu, out_exit(4))
     io.print("kept ", @len(line))
 
     // An exit claiming more elements than kvm_run holds is refused.
