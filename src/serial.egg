@@ -1,0 +1,97 @@
+// An 8250 UART at 0x3f8 (ttyS0), output only: enough for the kernel to find
+// it and print to it by polling. No interrupts and no input yet.
+
+const BASE = 0x3f8
+const PORTS = 8
+
+// Register offsets from BASE.
+const DATA = 0      // THR on write, RBR on read; divisor low with DLAB
+const IER = 1       // interrupt enable; divisor high with DLAB
+const IIR = 2       // interrupt identification on read, FCR on write
+const LCR = 3
+const MCR = 4
+const LSR = 5
+const MSR = 6
+const SCR = 7
+
+const LCR_DLAB: u8 = 0x80
+const MCR_LOOP: u8 = 0x10
+const LSR_THR_EMPTY: u8 = 0x60   // THRE and TEMT: ready to send
+const IIR_NONE: u8 = 0x01
+const MSR_IDLE: u8 = 0xb0        // DCD, DSR and CTS
+
+const Serial = struct {
+    ier: u8
+    lcr: u8
+    mcr: u8
+    scr: u8
+    dll: u8
+    dlh: u8
+
+    fn init() Serial {
+        return Serial{ .ier = 0, .lcr = 0x03, .mcr = 0x08, .scr = 0, .dll = 0x0c, .dlh = 0 }
+    }
+
+    fn owns(port: i64) bool {
+        return port >= BASE and port < BASE + PORTS
+    }
+
+    // A write to port; the byte sent, or -1 for a write to a register.
+    fn write(inout self: Serial, port: i64, v: u8) i64 {
+        const off = port - BASE
+        const dlab = self.lcr & LCR_DLAB != 0
+        if (off == DATA) {
+            if (dlab) {
+                self.dll = v
+            } else if (self.mcr & MCR_LOOP == 0) {
+                return @as(i64, v)
+            }
+        } else if (off == IER) {
+            if (dlab) {
+                self.dlh = v
+            } else {
+                self.ier = v & 0x0f
+            }
+        } else if (off == LCR) {
+            self.lcr = v
+        } else if (off == MCR) {
+            self.mcr = v & 0x1f
+        } else if (off == SCR) {
+            self.scr = v
+        }
+        return -1
+    }
+
+    fn read(self: Serial, port: i64) u8 {
+        const off = port - BASE
+        const dlab = self.lcr & LCR_DLAB != 0
+        if (off == DATA) {
+            if (dlab) {
+                return self.dll
+            }
+            return 0
+        } else if (off == IER) {
+            if (dlab) {
+                return self.dlh
+            }
+            return self.ier
+        } else if (off == IIR) {
+            return IIR_NONE
+        } else if (off == LCR) {
+            return self.lcr
+        } else if (off == MCR) {
+            return self.mcr
+        } else if (off == LSR) {
+            return LSR_THR_EMPTY
+        } else if (off == MSR) {
+            if (self.mcr & MCR_LOOP != 0) {
+                // Loopback, which the kernel's probe checks: DTR to DSR,
+                // RTS to CTS, OUT1 to RI, OUT2 to DCD.
+                const m = self.mcr
+                return ((m & 0x01) << 5) | ((m & 0x02) << 3) | ((m & 0x04) << 4) | ((m & 0x08) << 4)
+            }
+            return MSR_IDLE
+        }
+        return self.scr
+    }
+}
