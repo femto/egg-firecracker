@@ -10,6 +10,7 @@ const boot = @import("boot.egg")
 const serial = @import("serial.egg")
 
 const MEM_SIZE = 512 * 1024 * 1024
+const MAX_LINE = 4096
 const DEFAULT_CMDLINE = "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd"
 
 const I8042_COMMAND = 0x64
@@ -68,12 +69,11 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, kernel: str, cmdline: str)
         exits = exits + 1
         if (exit.reason == kvm.EXIT_IO and exit.write) {
             if (serial.Serial.owns(exit.port)) {
-                const c = uart.write(exit.port, @as(u8, exit.data & 0xff))
-                if (c == '\n') {
-                    io.print(line)
-                    a.resize(&line, 0, 0)
-                } else if (c >= 0 and c != '\r') {
-                    a.push(&line, @as(u8, c))
+                var i = 0
+                while (i < exit.count) {
+                    const v = try vcpu.out_value(exit, i)
+                    console(io, a, &line, uart.write(exit.port, @as(u8, v & 0xff)))
+                    i = i + 1
                 }
             } else if (exit.port == I8042_COMMAND and exit.data == I8042_RESET) {
                 done(io, a, &line, clock, start, exits, "the guest reset the machine (i8042)")
@@ -106,6 +106,19 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, kernel: str, cmdline: str)
             io.eprint("[vmm] exit reason ", exit.reason, ", detail ", exit.detail)
             return error.UnexpectedExit
         }
+    }
+}
+
+// A byte the guest sent to the serial port (-1 for none), printed a line at
+// a time. A line is printed at MAX_LINE bytes even without a newline, so a
+// guest cannot make the VMM hold its output without bound.
+fn console(io: Io, a: Allocator, inout line: Buf(u8), c: i64) void {
+    if (c == '\n' or (c >= 0 and @len(line) >= MAX_LINE)) {
+        io.print(line)
+        a.resize(&line, 0, 0)
+    }
+    if (c >= 0 and c != '\n' and c != '\r') {
+        a.push(&line, @as(u8, c))
     }
 }
 

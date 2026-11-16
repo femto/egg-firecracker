@@ -383,6 +383,17 @@ const Vcpu = struct {
         return Exit.other(reason, le(r, 32, 8))
     }
 
+    // Element i of what an out wrote: a string instruction (rep outsb) makes
+    // one exit for count elements of size bytes, one after another.
+    fn out_value(self: Vcpu, exit: Exit, i: i64) !u64 {
+        const n = exit.size * exit.count
+        if (exit.size > 8 or i < 0 or i >= exit.count or exit.data_offset < 0 or n < 0 or exit.data_offset > self.run_size - n) {
+            return error.BadExit
+        }
+        const r = @sliceFromPtr(self.run_page, self.run_size)
+        return le(r, exit.data_offset + i * exit.size, exit.size)
+    }
+
     // The value an in or an MMIO read gets: v in each of its count elements
     // of size bytes, where KVM looks for it when the vCPU runs again.
     fn complete_read(self: Vcpu, exit: Exit, v: u64) !void {
