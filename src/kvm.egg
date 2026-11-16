@@ -13,6 +13,8 @@ extern fn close(fd: i32) i32 uses fs
 // pointer argument, which the x86_64 calling convention passes the same way.
 extern fn ioctl(fd: i32, req: u64, arg: u64) i32 uses fs
 extern fn mmap(addr: *u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) *u8 uses alloc
+extern fn lseek(fd: i32, off: i64, whence: i32) i64 uses fs
+extern fn munmap(addr: *u8, len: usize) i32 uses alloc
 
 const O_RDWR: i32 = 2
 const O_CLOEXEC: i32 = 0x80000
@@ -22,35 +24,74 @@ const MAP_PRIVATE: i32 = 0x02
 const MAP_ANONYMOUS: i32 = 0x20
 const MAP_NORESERVE: i32 = 0x4000
 const MAP_FAILED: usize = 18446744073709551615
+const SEEK_END_: i32 = 2
+const PROT_READ: i32 = 1
 
-// ioctl numbers: _IO(0xAE, n), or _IOR/_IOW with the struct's size.
+// ioctl numbers: _IO(0xAE, n), or _IOR/_IOW/_IOWR with the struct's size.
 const KVM_GET_API_VERSION: u64 = 0xAE00
 const KVM_CREATE_VM: u64 = 0xAE01
 const KVM_GET_VCPU_MMAP_SIZE: u64 = 0xAE04
+const KVM_GET_SUPPORTED_CPUID: u64 = 0xC008AE05
 const KVM_CREATE_VCPU: u64 = 0xAE41
 const KVM_SET_USER_MEMORY_REGION: u64 = 0x4020AE46
+const KVM_SET_TSS_ADDR: u64 = 0xAE47
+const KVM_CREATE_IRQCHIP: u64 = 0xAE60
+const KVM_CREATE_PIT2: u64 = 0x4040AE77
 const KVM_RUN: u64 = 0xAE80
 const KVM_GET_REGS: u64 = 0x8090AE81
 const KVM_SET_REGS: u64 = 0x4090AE82
 const KVM_GET_SREGS: u64 = 0x8138AE83
 const KVM_SET_SREGS: u64 = 0x4138AE84
+const KVM_SET_FPU: u64 = 0x41A0AE8D
+const KVM_GET_LAPIC: u64 = 0x8400AE8E
+const KVM_SET_LAPIC: u64 = 0x4400AE8F
+const KVM_SET_CPUID2: u64 = 0x4008AE90
 
 const KVM_API_VERSION: i32 = 12
-const REGS_SIZE = 144     // struct kvm_regs: 18 u64
-const SREGS_SIZE = 312    // struct kvm_sregs
+const REGS_SIZE = 144       // struct kvm_regs: 18 u64
+const SREGS_SIZE = 312      // struct kvm_sregs
+const FPU_SIZE = 416        // struct kvm_fpu
+const LAPIC_SIZE = 1024     // struct kvm_lapic_state
+const CPUID_ENTRY_SIZE = 40 // struct kvm_cpuid_entry2
+const CPUID_MAX_ENTRIES = 256
+
+// Where KVM puts the three pages of the TSS Intel needs, below 4 GiB and
+// out of guest RAM; Firecracker's address.
+const TSS_ADDR: u64 = 0xfffbd000
 
 // kvm_run->exit_reason
 const EXIT_IO = 2
 const EXIT_HLT = 5
+const EXIT_MMIO = 6
 const EXIT_SHUTDOWN = 8
 const EXIT_FAIL_ENTRY = 9
 const EXIT_INTERNAL_ERROR = 17
+const EXIT_SYSTEM_EVENT = 24
 
 // kvm_regs, as indexes of u64
 const RAX = 0
 const RBX = 1
+const RSI = 4
+const RSP = 6
+const RBP = 7
 const RIP = 16
 const RFLAGS = 17
+
+// kvm_sregs: eight kvm_segments of 24 bytes (cs, ds, es, fs, gs, ss, tr,
+// ldt), two kvm_dtables of 16 (gdt, idt), then the control registers.
+const SREG_CS = 0
+const SREG_DS = 24
+const SREG_ES = 48
+const SREG_FS = 72
+const SREG_GS = 96
+const SREG_SS = 120
+const SREG_TR = 144
+const SREG_GDT = 192
+const SREG_IDT = 208
+const SREG_CR0 = 224
+const SREG_CR3 = 240
+const SREG_CR4 = 248
+const SREG_EFER = 264
 
 fn le(b: []u8, off: i64, n: i64) u64 {
     var v: u64 = 0
@@ -87,6 +128,39 @@ fn map(len: i64, prot: i32, flags: i32, fd: i32) !*u8 {
     return p
 }
 
+fn ioctl_buf(fd: i32, req: u64, b: Buf(u8)) !i32 {
+    return sys(ioctl(fd, req, @as(u64, @intFromPtr(@bufPtr(b)))))
+}
+
+fn close_fd(fd: i32) void {
+    _ = close(fd)
+}
+
+fn unmap(p: *u8, len: i64) void {
+    _ = munmap(p, @as(usize, len))
+}
+
+// The whole file at path. Through open and mmap rather than the fs
+// capability: using that makes the generated C include <fcntl.h>, whose
+// open (variadic, const char *) clashes with the extern fn above.
+fn read_file(a: Allocator, path: str) !Buf(u8) {
+    const fd = try sys(open(a.cstr(path), O_CLOEXEC))   // O_RDONLY
+    defer close_fd(fd)
+    const size = lseek(fd, 0, SEEK_END_)
+    if (size <= 0) {
+        return error.EmptyFile
+    }
+    const p = try map(size, PROT_READ, MAP_PRIVATE, fd)
+    defer unmap(p, size)
+    var b = a.alloc(size, @as(u8, 0))
+    var i = 0
+    while (i < size) {
+        b[i] = @ptrAdd(p, i).*
+        i = i + 1
+    }
+    return b
+}
+
 const Kvm = struct {
     fd: i32
 
@@ -103,11 +177,32 @@ const Kvm = struct {
         const fd = try sys(ioctl(self.fd, KVM_CREATE_VM, 0))
         return Vm{ .fd = fd, .kvm = self.fd }
     }
+
+    // struct kvm_cpuid2: nent, padding, then nent kvm_cpuid_entry2.
+    fn supported_cpuid(self: Kvm, a: Allocator) !Buf(u8) {
+        var b = a.alloc(8 + CPUID_MAX_ENTRIES * CPUID_ENTRY_SIZE, @as(u8, 0))
+        errdefer a.free(b)
+        put_le(&b[0..], 0, 4, @as(u64, CPUID_MAX_ENTRIES))
+        _ = try ioctl_buf(self.fd, KVM_GET_SUPPORTED_CPUID, b)
+        return b
+    }
 }
 
 const Vm = struct {
     fd: i32
     kvm: i32
+
+    // The interrupt controllers (PIC, IOAPIC, a local APIC per vCPU) and
+    // the PIT live in KVM, as in Firecracker.
+    fn create_irqchip(self: Vm, a: Allocator) !void {
+        _ = try sys(ioctl(self.fd, KVM_SET_TSS_ADDR, TSS_ADDR))
+        _ = try sys(ioctl(self.fd, KVM_CREATE_IRQCHIP, 0))
+        // struct kvm_pit_config: flags, then padding; KVM_PIT_SPEAKER_DUMMY.
+        var pit = a.alloc(64, @as(u8, 0))
+        defer a.free(pit)
+        put_le(&pit[0..], 0, 4, 1)
+        _ = try ioctl_buf(self.fd, KVM_CREATE_PIT2, pit)
+    }
 
     // Anonymous memory of size bytes, seen by the guest at gpa.
     fn add_memory(self: Vm, a: Allocator, slot: u32, gpa: u64, size: i64) !GuestMemory {
@@ -119,7 +214,7 @@ const Vm = struct {
         put_le(&region[0..], 8, 8, gpa)
         put_le(&region[0..], 16, 8, @as(u64, size))
         put_le(&region[0..], 24, 8, @as(u64, @intFromPtr(p)))
-        _ = try sys(ioctl(self.fd, KVM_SET_USER_MEMORY_REGION, @as(u64, @intFromPtr(@bufPtr(region)))))
+        _ = try ioctl_buf(self.fd, KVM_SET_USER_MEMORY_REGION, region)
         return GuestMemory{ .base = p, .gpa = gpa, .size = size }
     }
 
@@ -137,8 +232,15 @@ const GuestMemory = struct {
     size: i64
 
     fn offset(self: GuestMemory, addr: u64, n: i64) i64 {
-        const off = @as(i64, addr - self.gpa)
-        if (addr < self.gpa or n < 0 or off > self.size - n) {
+        if (addr < self.gpa or n < 0) {
+            return -1
+        }
+        const rel = addr - self.gpa
+        if (rel > @as(u64, self.size)) {
+            return -1
+        }
+        const off = @as(i64, rel)
+        if (off > self.size - n) {
             return -1
         }
         return off
@@ -169,12 +271,20 @@ const GuestMemory = struct {
 // Why KVM_RUN returned, from the vCPU's kvm_run page.
 const Exit = struct {
     reason: i64
-    // KVM_EXIT_IO
-    out: bool
+    // KVM_EXIT_IO (port) and KVM_EXIT_MMIO (addr)
+    write: bool
     size: i64
     port: i64
     count: i64
-    data: u64     // the first byte(s) written, for an out of up to 8 bytes
+    addr: u64
+    data: u64     // what the guest wrote, for an access of up to 8 bytes
+    data_offset: i64
+    // KVM_EXIT_FAIL_ENTRY, KVM_EXIT_INTERNAL_ERROR, KVM_EXIT_SYSTEM_EVENT
+    detail: u64
+
+    fn other(reason: i64, detail: u64) Exit {
+        return Exit{ .reason = reason, .write = false, .size = 0, .port = 0, .count = 0, .addr = 0, .data = 0, .data_offset = 0, .detail = detail }
+    }
 }
 
 const Vcpu = struct {
@@ -185,47 +295,128 @@ const Vcpu = struct {
     fn get_regs(self: Vcpu, a: Allocator) !Buf(u8) {
         const b = a.alloc(REGS_SIZE, @as(u8, 0))
         errdefer a.free(b)
-        _ = try sys(ioctl(self.fd, KVM_GET_REGS, @as(u64, @intFromPtr(@bufPtr(b)))))
+        _ = try ioctl_buf(self.fd, KVM_GET_REGS, b)
         return b
     }
 
     fn set_regs(self: Vcpu, regs: Buf(u8)) !void {
-        _ = try sys(ioctl(self.fd, KVM_SET_REGS, @as(u64, @intFromPtr(@bufPtr(regs)))))
+        _ = try ioctl_buf(self.fd, KVM_SET_REGS, regs)
     }
 
     fn get_sregs(self: Vcpu, a: Allocator) !Buf(u8) {
         const b = a.alloc(SREGS_SIZE, @as(u8, 0))
         errdefer a.free(b)
-        _ = try sys(ioctl(self.fd, KVM_GET_SREGS, @as(u64, @intFromPtr(@bufPtr(b)))))
+        _ = try ioctl_buf(self.fd, KVM_GET_SREGS, b)
         return b
     }
 
     fn set_sregs(self: Vcpu, sregs: Buf(u8)) !void {
-        _ = try sys(ioctl(self.fd, KVM_SET_SREGS, @as(u64, @intFromPtr(@bufPtr(sregs)))))
+        _ = try ioctl_buf(self.fd, KVM_SET_SREGS, sregs)
+    }
+
+    fn set_cpuid(self: Vcpu, cpuid: Buf(u8)) !void {
+        _ = try ioctl_buf(self.fd, KVM_SET_CPUID2, cpuid)
+    }
+
+    // x87 control word and MXCSR at their reset values; KVM leaves them 0.
+    fn init_fpu(self: Vcpu, a: Allocator) !void {
+        var fpu = a.alloc(FPU_SIZE, @as(u8, 0))
+        defer a.free(fpu)
+        put_le(&fpu[0..], 128, 2, 0x37f)
+        put_le(&fpu[0..], 408, 4, 0x1f80)
+        _ = try ioctl_buf(self.fd, KVM_SET_FPU, fpu)
+    }
+
+    // LINT0 delivers the PIC's interrupts (ExtINT) and LINT1 NMIs, the
+    // local APIC's virtual wire mode, as Firecracker sets it.
+    fn init_lapic(self: Vcpu, a: Allocator) !void {
+        var lapic = a.alloc(LAPIC_SIZE, @as(u8, 0))
+        defer a.free(lapic)
+        _ = try ioctl_buf(self.fd, KVM_GET_LAPIC, lapic)
+        const lint0 = le(lapic[0..], 0x350, 4)
+        const lint1 = le(lapic[0..], 0x360, 4)
+        put_le(&lapic[0..], 0x350, 4, (lint0 & ~@as(u64, 0x700)) | 0x700)
+        put_le(&lapic[0..], 0x360, 4, (lint1 & ~@as(u64, 0x700)) | 0x400)
+        _ = try ioctl_buf(self.fd, KVM_SET_LAPIC, lapic)
     }
 
     fn run(self: Vcpu) !Exit {
         _ = try sys(ioctl(self.fd, KVM_RUN, 0))
         const r = @sliceFromPtr(self.run_page, self.run_size)
-        // struct kvm_run: exit_reason at 8; the io member of its union at 32
-        // (direction, size, port, count, data_offset).
+        // struct kvm_run: exit_reason at 8; the union of exit details at 32.
         const reason = @as(i64, le(r, 8, 4))
-        if (reason != EXIT_IO) {
-            return Exit{ .reason = reason, .out = false, .size = 0, .port = 0, .count = 0, .data = 0 }
+        if (reason == EXIT_IO) {
+            // io: direction (1 = out), size, port, count, data_offset
+            const size = @as(i64, le(r, 33, 1))
+            const data_offset = @as(i64, le(r, 40, 8))
+            var data: u64 = 0
+            if (size <= 8 and data_offset >= 0 and data_offset <= self.run_size - size) {
+                data = le(r, data_offset, size)
+            }
+            return Exit{
+                .reason = reason,
+                .write = le(r, 32, 1) == 1,
+                .size = size,
+                .port = @as(i64, le(r, 34, 2)),
+                .count = @as(i64, le(r, 36, 4)),
+                .addr = 0,
+                .data = data,
+                .data_offset = data_offset,
+                .detail = 0,
+            }
         }
-        const size = @as(i64, le(r, 33, 1))
-        const data_offset = @as(i64, le(r, 40, 8))
-        var data: u64 = 0
-        if (size <= 8 and data_offset >= 0 and data_offset <= self.run_size - size) {
-            data = le(r, data_offset, size)
+        if (reason == EXIT_MMIO) {
+            // mmio: phys_addr, data[8], len, is_write
+            const len = @as(i64, le(r, 48, 4))
+            var data: u64 = 0
+            if (len <= 8) {
+                data = le(r, 40, len)
+            }
+            return Exit{
+                .reason = reason,
+                .write = le(r, 52, 1) == 1,
+                .size = len,
+                .port = 0,
+                .count = 1,
+                .addr = le(r, 32, 8),
+                .data = data,
+                .data_offset = 40,
+                .detail = 0,
+            }
         }
-        return Exit{
-            .reason = reason,
-            .out = le(r, 32, 1) == 1,
-            .size = size,
-            .port = @as(i64, le(r, 34, 2)),
-            .count = @as(i64, le(r, 36, 4)),
-            .data = data,
+        // fail_entry.hardware_entry_failure_reason, internal.suberror and
+        // system_event.type all start the union.
+        return Exit.other(reason, le(r, 32, 8))
+    }
+
+    // Element i of what an out wrote: a string instruction (rep outsb) makes
+    // one exit for count elements of size bytes, one after another.
+    fn out_value(self: Vcpu, exit: Exit, i: i64) !u64 {
+        const n = exit.size * exit.count
+        if (exit.size > 8 or i < 0 or i >= exit.count or exit.data_offset < 0 or n < 0 or exit.data_offset > self.run_size - n) {
+            return error.BadExit
+        }
+        const r = @sliceFromPtr(self.run_page, self.run_size)
+        return le(r, exit.data_offset + i * exit.size, exit.size)
+    }
+
+    // The value an in or an MMIO read gets: v in each of its count elements
+    // of size bytes, where KVM looks for it when the vCPU runs again.
+    fn complete_read(self: Vcpu, exit: Exit, v: u64) !void {
+        const n = exit.size * exit.count
+        if (exit.size > 8 or exit.data_offset < 0 or n < 0 or exit.data_offset > self.run_size - n) {
+            return error.BadExit
+        }
+        var i = 0
+        while (i < exit.count) {
+            var x = v
+            var j = 0
+            while (j < exit.size) {
+                @ptrAdd(self.run_page, exit.data_offset + i * exit.size + j).* = @as(u8, x & 0xff)
+                x = x >> 8
+                j = j + 1
+            }
+            i = i + 1
         }
     }
 }

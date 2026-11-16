@@ -1,0 +1,62 @@
+// A string out (rep outsb) of "AB\n" to the serial port: every byte must
+// come through. The KVM API lets one exit carry count 3; the KVMs this ran
+// on (nested, in VMware) made three exits of one instead, so this checks
+// the bytes arrive, not that path.
+uses io, fs, alloc
+const kvm = @import("firecracker/kvm")
+
+const GUEST_ADDR: u64 = 0x1000
+const SERIAL_PORT = 0x3f8
+
+fn main(io: Io, files: Fs, a: Allocator) !void {
+    const k = try kvm.Kvm.init(a)
+    const vm = try k.create_vm()
+    const mem = try vm.add_memory(a, 0, GUEST_ADDR, 0x1000)
+
+    const code = [16]u8{
+        0xba, 0xf8, 0x03, // mov $0x3f8, %dx
+        0xbe, 0x0d, 0x10, // mov $0x100d, %si: the text below
+        0xb9, 0x03, 0x00, // mov $3, %cx
+        0xfc,             // cld
+        0xf3, 0x6e,       // rep outsb (%si), (%dx)
+        0xf4,             // hlt
+        'A', 'B', '\n',
+    }
+    try mem.write(GUEST_ADDR, code[0..])
+
+    const vcpu = try vm.create_vcpu(0)
+    // Real mode with cs and ds based at 0 (ds already is after reset).
+    var sregs = try vcpu.get_sregs(a)
+    defer a.free(sregs)
+    kvm.put_le(&sregs[0..], 0, 8, 0)
+    kvm.put_le(&sregs[0..], 12, 2, 0)
+    try vcpu.set_sregs(sregs)
+    var regs = a.alloc(kvm.REGS_SIZE, @as(u8, 0))
+    defer a.free(regs)
+    kvm.put_le(&regs[0..], kvm.RIP * 8, 8, GUEST_ADDR)
+    kvm.put_le(&regs[0..], kvm.RFLAGS * 8, 8, 0x2)
+    try vcpu.set_regs(regs)
+
+    var line = Buf(u8).empty
+    defer a.free(line)
+    while (true) {
+        const exit = try vcpu.run()
+        if (exit.reason == kvm.EXIT_HLT) {
+            return
+        } else if (exit.reason == kvm.EXIT_IO and exit.write and exit.port == SERIAL_PORT and exit.size == 1) {
+            var i = 0
+            while (i < exit.count) {
+                const c = @as(u8, try vcpu.out_value(exit, i))
+                if (c == '\n') {
+                    io.print("guest: ", line)
+                    a.resize(&line, 0, 0)
+                } else {
+                    a.push(&line, c)
+                }
+                i = i + 1
+            }
+        } else {
+            return error.UnhandledExit
+        }
+    }
+}
