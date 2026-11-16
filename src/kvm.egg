@@ -14,6 +14,7 @@ extern fn close(fd: i32) i32 uses fs
 extern fn ioctl(fd: i32, req: u64, arg: u64) i32 uses fs
 extern fn mmap(addr: *u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) *u8 uses alloc
 extern fn lseek(fd: i32, off: i64, whence: i32) i64 uses fs
+extern fn munmap(addr: *u8, len: usize) i32 uses alloc
 
 const O_RDWR: i32 = 2
 const O_CLOEXEC: i32 = 0x80000
@@ -135,6 +136,10 @@ fn close_fd(fd: i32) void {
     _ = close(fd)
 }
 
+fn unmap(p: *u8, len: i64) void {
+    _ = munmap(p, @as(usize, len))
+}
+
 // The whole file at path. Through open and mmap rather than the fs
 // capability: using that makes the generated C include <fcntl.h>, whose
 // open (variadic, const char *) clashes with the extern fn above.
@@ -146,6 +151,7 @@ fn read_file(a: Allocator, path: str) !Buf(u8) {
         return error.EmptyFile
     }
     const p = try map(size, PROT_READ, MAP_PRIVATE, fd)
+    defer unmap(p, size)
     var b = a.alloc(size, @as(u8, 0))
     var i = 0
     while (i < size) {

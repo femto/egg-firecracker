@@ -1,0 +1,44 @@
+// The serial console: what the guest writes to ttyS0, printed a line at a
+// time.
+uses io, alloc
+const kvm = @import("kvm.egg")
+const serial = @import("serial.egg")
+
+// A line is printed at MAX_LINE bytes even without a newline, so a guest
+// cannot make the VMM hold its output without bound.
+const MAX_LINE = 4096
+
+// An out to the UART: every one of its count elements, which a string out
+// (rep outsb) can carry in one exit.
+fn out(io: Io, a: Allocator, inout uart: serial.Serial, inout line: Buf(u8), vcpu: kvm.Vcpu, exit: kvm.Exit) !void {
+    var i = 0
+    while (i < exit.count) {
+        const v = try vcpu.out_value(exit, i)
+        put(io, a, &line, uart.write(exit.port, @as(u8, v & 0xff)))
+        i = i + 1
+    }
+}
+
+// A byte the UART sent, or -1 for a write to one of its registers.
+fn put(io: Io, a: Allocator, inout line: Buf(u8), c: i64) void {
+    if (c == '\n') {
+        print(io, a, &line)
+    } else if (c >= 0 and c != '\r') {
+        a.push(&line, @as(u8, c))
+        if (@len(line) >= MAX_LINE) {
+            print(io, a, &line)
+        }
+    }
+}
+
+// What is left of the last line, when the guest stops.
+fn flush(io: Io, a: Allocator, inout line: Buf(u8)) void {
+    if (@len(line) > 0) {
+        print(io, a, &line)
+    }
+}
+
+fn print(io: Io, a: Allocator, inout line: Buf(u8)) void {
+    io.print(line)
+    a.resize(&line, 0, 0)
+}
