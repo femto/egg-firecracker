@@ -135,19 +135,16 @@ const Serial = struct {
         } else if (off == MCR) {
             const was_open = self.mcr & MCR_OUT2 != 0
             self.mcr = v & 0x1f
-            if (!was_open and self.mcr & MCR_OUT2 != 0 and self.pending()) {
-                // Opening the gate on a pending interrupt raises the line.
+            if (!was_open and self.mcr & MCR_OUT2 != 0 and (self.thre or self.ier & IER_RDA != 0)) {
+                // Opening the gate on a pending interrupt raises the line;
+                // with the received-data interrupt enabled, input may be
+                // waiting outside the FIFO, as when it is enabled.
                 self.raise = true
             }
         } else if (off == SCR) {
             self.scr = v
         }
         return -1
-    }
-
-    // An enabled interrupt is waiting for IIR to report it.
-    fn pending(self: Serial) bool {
-        return self.thre or (self.ier & IER_RDA != 0 and self.rx_len > 0)
     }
 
     fn thr_empty(inout self: Serial) void {

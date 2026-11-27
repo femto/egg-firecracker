@@ -79,6 +79,15 @@ fn main(io: Io) void {
     io.print("RDA alone, FIFO empty: irq ", u.take_irq())
     _ = u.write(IER, 0x03)
     _ = u.take_irq()
+    // Enabled behind a closed OUT2, it raises the line when OUT2 opens.
+    _ = u.write(MCR, 0x00)
+    _ = u.write(IER, 0x00)
+    _ = u.write(IER, 0x01)
+    io.print("RDA enabled behind OUT2: irq ", u.take_irq())
+    _ = u.write(MCR, 0x08)
+    io.print("OUT2 opened, FIFO empty: irq ", u.take_irq())
+    _ = u.write(IER, 0x03)
+    _ = u.take_irq()
     // Input comes in on reads of RBR, IIR and LSR, not IER (which the
     // kernel's probe writes and reads back), nor the divisor latch.
     io.print("takes input: rbr ", u.reads_rx(THR), ", iir ", u.reads_rx(IIR), ", lsr ", u.reads_rx(LSR), ", ier ", u.reads_rx(IER))
