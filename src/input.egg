@@ -1,7 +1,7 @@
 // Standard input to the guest's serial port. A thread of its own reads it,
 // as the vCPU thread spends its time inside KVM_RUN, and sends the bytes
 // over a channel; the vCPU thread moves them into the UART's FIFO when the
-// guest next touches the UART. An edge on the UART's IRQ makes it do so,
+// guest next reads RBR, IIR or LSR. An edge on the UART's IRQ makes it do so,
 // waking a guest that is idle without leaving KVM_RUN.
 //
 // ^A x ends the VMM, as in QEMU; ^A ^A sends one ^A.
@@ -48,7 +48,8 @@ fn run(sink tx: Sender(u8), io: Io, a: Allocator, vm: kvm.Vm, sink saved: Buf(u8
     }
 }
 
-// Moves what has arrived into the UART, as much as its FIFO takes.
+// Moves what has arrived into the UART, as much as its FIFO takes; none
+// while the guest has the received-data interrupt disabled.
 fn drain(rx: Receiver(u8), inout uart: serial.Serial) void {
     while (uart.rx_room() > 0) {
         const got = rx.recv_timeout(0)

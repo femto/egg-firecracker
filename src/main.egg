@@ -29,7 +29,11 @@ fn main(io: Io, args: Args, files: Fs, a: Allocator, clock: Clock, threads: Thre
     var cmdline = DEFAULT_CMDLINE
     var i = 2
     while (i < args.len()) {
-        if (args.get(i) == "--initrd" and i + 1 < args.len()) {
+        if (args.get(i) == "--initrd") {
+            if (i + 1 == args.len()) {
+                io.eprint("usage: firecracker VMLINUX [--initrd FILE] [CMDLINE]")
+                return
+            }
             initrd = args.get(i + 1)
             i = i + 2
         } else {
@@ -102,7 +106,6 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
         exits = exits + 1
         if (exit.reason == kvm.EXIT_IO and exit.write) {
             if (serial.Serial.owns(exit.port)) {
-                input.drain(rx, &uart)
                 try console.out(io, a, &uart, &line, vcpu, exit, live)
                 if (uart.take_irq()) {
                     try vm.irq_pulse(a, serial.IRQ)
@@ -114,7 +117,9 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
         } else if (exit.reason == kvm.EXIT_IO) {
             var v: u64 = 0
             if (serial.Serial.owns(exit.port)) {
-                input.drain(rx, &uart)
+                if (uart.reads_rx(exit.port)) {
+                    input.drain(rx, &uart)
+                }
                 v = @as(u64, uart.read(exit.port))
             } else if (exit.port != I8042_COMMAND and exit.port != CMOS_DATA) {
                 // Nothing here: the bus floats high.

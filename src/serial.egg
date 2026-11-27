@@ -56,9 +56,21 @@ const Serial = struct {
         return Serial{ .ier = 0, .lcr = 0x03, .mcr = 0x08, .scr = 0, .dll = 0x0c, .dlh = 0, .thre = false, .raise = false, .rx = @splat(0), .rx_head = 0, .rx_len = 0 }
     }
 
-    // Room in the receive FIFO.
+    // Room in the receive FIFO for input. Input waits outside until the
+    // guest reads RBR, IIR or LSR with the received-data interrupt enabled:
+    // the 8250 driver reads and drops what is in RBR as it opens the port,
+    // and its probe enables every interrupt for a moment.
     fn rx_room(self: Serial) i64 {
+        if (self.ier & IER_RDA == 0) {
+            return 0
+        }
         return FIFO_SIZE - self.rx_len
+    }
+
+    // Whether a read of port may take input: RBR, IIR or LSR.
+    fn reads_rx(self: Serial, port: i64) bool {
+        const off = port - BASE
+        return (off == DATA and self.lcr & LCR_DLAB == 0) or off == IIR or off == LSR
     }
 
     // A byte from the outside; false when the FIFO is full and it is not
@@ -105,8 +117,9 @@ const Serial = struct {
                 const was = self.ier & IER_THRE != 0
                 const was_rda = self.ier & IER_RDA != 0
                 self.ier = v & 0x0f
-                if (!was_rda and self.rx_len > 0) {
-                    // Enabling it with data waiting raises it.
+                if (!was_rda and self.ier & IER_RDA != 0) {
+                    // Input may be waiting outside the FIFO: an edge, and
+                    // the handler's read of IIR brings it in.
                     self.data_ready()
                 }
                 if (self.ier & IER_THRE == 0) {
@@ -120,11 +133,21 @@ const Serial = struct {
         } else if (off == LCR) {
             self.lcr = v
         } else if (off == MCR) {
+            const was_open = self.mcr & MCR_OUT2 != 0
             self.mcr = v & 0x1f
+            if (!was_open and self.mcr & MCR_OUT2 != 0 and self.pending()) {
+                // Opening the gate on a pending interrupt raises the line.
+                self.raise = true
+            }
         } else if (off == SCR) {
             self.scr = v
         }
         return -1
+    }
+
+    // An enabled interrupt is waiting for IIR to report it.
+    fn pending(self: Serial) bool {
+        return self.thre or (self.ier & IER_RDA != 0 and self.rx_len > 0)
     }
 
     fn thr_empty(inout self: Serial) void {
