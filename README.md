@@ -4,8 +4,8 @@ A microVM monitor in [Egg](https://github.com/femto/egg), after
 [Firecracker](https://github.com/firecracker-microvm/firecracker): it drives
 Linux KVM through `/dev/kvm` to run guests.
 
-`src/kvm.egg` is the only `allow unsafe` file. It wraps `open`, `ioctl` and
-`mmap`, and gives the rest of the VMM guest memory and the vCPU's `kvm_run`
+`src/kvm.egg` is the only `allow unsafe` file. It wraps `open`, `ioctl`,
+`mmap` and the terminal, and gives the rest of the VMM guest memory and the vCPU's `kvm_run`
 page through bounds-checked methods, so device code reading guest-controlled
 offsets and lengths panics or fails instead of corrupting memory.
 
@@ -30,24 +30,28 @@ $ firecracker vmlinux-6.18.62
 
 With `--initrd`, the initramfs goes at the top of guest memory, as in
 Firecracker, and the kernel runs its `/init`. The UART raises its
-transmitter-empty interrupt on IRQ 4, which the tty driver needs to send
-what user space writes. `tools/mkinitramfs.sh` builds a busybox initramfs
-whose `/init` prints what it finds and reboots, since the UART takes no
-input yet:
+transmitter-empty and received-data interrupts on IRQ 4, and standard input
+reaches it: a thread reads it and sends the bytes over a channel, and the
+vCPU thread moves them into the UART's FIFO. On a terminal, input is raw
+(^C goes to the guest) and ^A x stops the VMM. `tools/mkinitramfs.sh`
+builds a busybox initramfs whose `/init` starts a shell on the console:
 
 ```
 $ firecracker vmlinux-6.18.62 --initrd initramfs.cpio
-=== initramfs: /init is running (pid 1) ===
-Linux (none) 6.18.62+ #1 SMP PREEMPT_DYNAMIC ... x86_64 GNU/Linux
+[vmm] the console takes the keyboard: ^A x stops
 ...
-=== no serial input yet: rebooting ===
-[vmm] the guest reset the machine (i8042) after 3903 ms and 47029 VM exits
+=== busybox sh on ttyS0; exit reboots ===
+~ # echo hello from $(uname -r)
+hello from 6.18.62+
+~ # grep ttyS /proc/interrupts
+  4:        237   XT-PIC      ttyS0
+~ # exit
+[vmm] the guest reset the machine (i8042) after 9492 ms and 48617 VM exits
 ```
 
 `test/real_mode.egg` is stage 0: a vCPU running 12 bytes of real-mode code.
 
-Next: virtio block, to mount a root file system, and serial input, to reach
-a shell.
+Next: virtio block, to mount a root file system.
 
 ## Running
 

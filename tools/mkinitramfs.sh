@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds a busybox initramfs (an uncompressed newc cpio) whose /init prints
-# what it finds and reboots: the serial port takes no input yet, so there
-# is no shell to type into. Runs on Linux and needs a static busybox
-# (Arch: pacman -S busybox) and cpio or bsdtar.
+# what it finds and starts a shell on the serial console; leaving the shell
+# reboots. Runs on Linux and needs a static busybox (Arch: pacman -S
+# busybox) and cpio or bsdtar.
 #
 #     tools/mkinitramfs.sh [OUT]        # default build/initramfs.cpio
 set -euo pipefail
@@ -41,7 +41,12 @@ grep -m1 'model name' /proc/cpuinfo
 free -m
 echo "/:" $(ls /)
 echo "uptime: $(cut -d' ' -f1 /proc/uptime) s"
-echo "=== no serial input yet: rebooting ==="
+echo "=== busybox sh on ttyS0; exit reboots ==="
+export HOME=/root TERM=vt100 PATH=/bin:/sbin:/usr/bin:/usr/sbin
+mkdir -p /root && cd /root
+# setsid and cttyhack give the shell the console as its controlling
+# terminal, so ^C and job control work.
+setsid cttyhack sh
 reboot -f
 INIT
 chmod +x "$root/init"

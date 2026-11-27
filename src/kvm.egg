@@ -1,10 +1,11 @@
-// KVM through /dev/kvm (x86_64 Linux). This is the only unsafe file: the
-// rest of the VMM reaches guest memory and kvm_run through the bounds-checked
-// methods below.
+// KVM through /dev/kvm (x86_64 Linux), and the terminal. This is the only
+// unsafe file: the rest of the VMM reaches guest memory and kvm_run through
+// the bounds-checked methods below.
 //
 // Egg has no C struct layout yet, so the KVM structs are byte buffers with
-// fields at their offsets from <linux/kvm.h>.
-uses fs, alloc
+// fields at their offsets from <linux/kvm.h>, and struct termios one with
+// glibc's x86_64 offsets.
+uses fs, alloc, io
 allow unsafe
 
 extern fn open(path: *u8, flags: i32) i32 uses fs
@@ -15,6 +16,14 @@ extern fn ioctl(fd: i32, req: u64, arg: u64) i32 uses fs
 extern fn mmap(addr: *u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) *u8 uses alloc
 extern fn lseek(fd: i32, off: i64, whence: i32) i64 uses fs
 extern fn munmap(addr: *u8, len: usize) i32 uses alloc
+// Io reads its standard input a line at a time; a guest's console wants
+// each byte as it is typed, with the terminal in raw mode.
+extern fn read(fd: i32, buf: *u8, n: usize) i64 uses io
+extern fn write(fd: i32, buf: *u8, n: usize) i64 uses io
+extern fn isatty(fd: i32) i32 uses io
+extern fn tcgetattr(fd: i32, t: *u8) i32 uses io
+extern fn tcsetattr(fd: i32, when: i32, t: *u8) i32 uses io
+extern fn _exit(code: i32) void uses io
 
 const O_RDWR: i32 = 2
 const O_CLOEXEC: i32 = 0x80000
@@ -26,6 +35,21 @@ const MAP_NORESERVE: i32 = 0x4000
 const MAP_FAILED: usize = 18446744073709551615
 const SEEK_END_: i32 = 2
 const PROT_READ: i32 = 1
+
+// struct termios: c_iflag, c_oflag, c_cflag, c_lflag (u32 each), c_line,
+// c_cc[32], then the speeds.
+const TERMIOS_SIZE = 60
+const C_IFLAG = 0
+const C_LFLAG = 12
+const C_CC_VTIME = 17 + 5
+const C_CC_VMIN = 17 + 6
+const ICRNL: u64 = 0x100
+const IXON: u64 = 0x400
+const ISIG: u64 = 0x1
+const ICANON: u64 = 0x2
+const ECHO: u64 = 0x8
+const IEXTEN: u64 = 0x8000
+const TCSANOW: i32 = 0
 
 // ioctl numbers: _IO(0xAE, n), or _IOR/_IOW/_IOWR with the struct's size.
 const KVM_GET_API_VERSION: u64 = 0xAE00
@@ -139,6 +163,60 @@ fn close_fd(fd: i32) void {
 
 fn unmap(p: *u8, len: i64) void {
     _ = munmap(p, @as(usize, len))
+}
+
+// Puts standard input, when it is a terminal, in raw mode: every byte as it
+// is typed, unechoed, with ^C and ^Z bytes like the rest, for the guest.
+// Output keeps its processing, so a newline still starts a line. Gives the
+// settings to restore, empty when standard input is not a terminal.
+fn raw_stdin(a: Allocator) !Buf(u8) {
+    var saved = a.alloc(TERMIOS_SIZE, @as(u8, 0))
+    errdefer a.free(saved)
+    if (isatty(0) == 0) {
+        a.resize(&saved, 0, 0)
+        return saved
+    }
+    _ = try sys(tcgetattr(0, @bufPtr(saved)))
+    var t = a.alloc(TERMIOS_SIZE, @as(u8, 0))
+    defer a.free(t)
+    _ = try sys(tcgetattr(0, @bufPtr(t)))
+    const iflag = le(t, C_IFLAG, 4) & ~(ICRNL | IXON)
+    const lflag = le(t, C_LFLAG, 4) & ~(ISIG | ICANON | ECHO | IEXTEN)
+    put_le(&t[0..], C_IFLAG, 4, iflag)
+    put_le(&t[0..], C_LFLAG, 4, lflag)
+    t[C_CC_VTIME] = 0
+    t[C_CC_VMIN] = 1
+    _ = try sys(tcsetattr(0, TCSANOW, @bufPtr(t)))
+    return saved
+}
+
+fn restore_stdin(saved: Buf(u8)) void {
+    if (@len(saved) == TERMIOS_SIZE) {
+        _ = tcsetattr(0, TCSANOW, @bufPtr(saved))
+    }
+}
+
+// Up to @len(b) bytes of standard input into b; 0 at its end, negative on
+// an error.
+fn read_stdin(b: Buf(u8)) i64 {
+    return read(0, @bufPtr(b), @as(usize, @len(b)))
+}
+
+// All of b to standard output, as it is: no line added.
+fn write_stdout(b: Buf(u8)) void {
+    var done = 0
+    while (done < @len(b)) {
+        const n = write(1, @ptrAdd(@bufPtr(b), done), @as(usize, @len(b) - done))
+        if (n <= 0) {
+            return
+        }
+        done = done + n
+    }
+}
+
+// Ends the process at once, with every thread.
+fn exit_now(code: i32) void {
+    _exit(code)
 }
 
 // The whole file at path. Through open and mmap rather than the fs

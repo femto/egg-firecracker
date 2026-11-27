@@ -6,3 +6,9 @@ byte: irq true, iir 2 then 1
 raised, then disabled: irq false, iir 1 then 1
 OUT2 low: irq false, iir 2 then 1
 divisor latch write: irq false, iir 1 then 1
+received, RDA disabled: irq false, lsr 97
+RDA enabled: irq true, iir 4 then 4
+read 104 105, then 0; lsr 96
+after the data: irq false, iir 2 then 1
+one more: irq true
+FIFO took 64, room 0

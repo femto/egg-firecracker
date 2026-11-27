@@ -1,5 +1,6 @@
 // The UART's transmitter-empty (THRE) interrupt, which the tty driver waits
-// for before each byte user space writes. Needs no KVM.
+// for before each byte user space writes, and its receive side. Needs no
+// KVM.
 uses io
 const serial = @import("firecracker/serial")
 
@@ -8,6 +9,7 @@ const IER = 0x3f9
 const IIR = 0x3fa
 const LCR = 0x3fb
 const MCR = 0x3fc
+const LSR = 0x3fd
 
 fn show(io: Io, inout u: serial.Serial, what: str) void {
     const irq = u.take_irq()
@@ -37,4 +39,29 @@ fn main(io: Io) void {
     _ = u.write(LCR, 0x83)
     _ = u.write(THR, 0x0c)
     show(io, &u, "divisor latch write")
+    _ = u.write(LCR, 0x03)
+
+    // Received data, with its interrupt disabled: no edge, LSR shows it.
+    _ = u.write(IER, 0x00)
+    _ = u.receive('h')
+    _ = u.receive('i')
+    io.print("received, RDA disabled: irq ", u.take_irq(), ", lsr ", u.read(LSR))
+    // Enabling it with data waiting raises it; IIR reports it, and keeps
+    // reporting it until the data is read.
+    _ = u.write(IER, 0x03)
+    io.print("RDA enabled: irq ", u.take_irq(), ", iir ", u.read(IIR), " then ", u.read(IIR))
+    const h = u.read(THR)
+    const i = u.read(THR)
+    io.print("read ", h, " ", i, ", then ", u.read(THR), "; lsr ", u.read(LSR))
+    // The data read, THRE (raised with the enable) is next, once.
+    show(io, &u, "after the data")
+    _ = u.receive('!')
+    io.print("one more: irq ", u.take_irq())
+    _ = u.read(THR)
+    // The FIFO holds 64.
+    var n = 0
+    while (u.receive('z')) {
+        n = n + 1
+    }
+    io.print("FIFO took ", n, ", room ", u.rx_room())
 }

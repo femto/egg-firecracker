@@ -1,8 +1,9 @@
-// An 8250 UART at 0x3f8 (ttyS0), output only. The kernel's console prints
-// by polling it; the tty driver, which carries what user space writes,
-// sends a byte each time the transmitter-empty (THRE) interrupt arrives on
-// IRQ 4. A byte written is sent at once, so the transmitter is always
-// empty. No input yet.
+// An 8250 UART at 0x3f8 (ttyS0). The kernel's console prints by polling
+// it; the tty driver, which carries what user space writes, sends a byte
+// each time the transmitter-empty (THRE) interrupt arrives on IRQ 4. A byte
+// written is sent at once, so the transmitter is always empty. Bytes
+// received wait in a FIFO, with the received-data interrupt raised while
+// there are any.
 
 const BASE = 0x3f8
 const PORTS = 8
@@ -19,14 +20,21 @@ const SCR = 7
 
 const IRQ: u64 = 4
 
+const IER_RDA: u8 = 0x01
 const IER_THRE: u8 = 0x02
 const LCR_DLAB: u8 = 0x80
 const MCR_OUT2: u8 = 0x08        // gates the IRQ on PC UARTs
 const MCR_LOOP: u8 = 0x10
+const LSR_DATA_READY: u8 = 0x01
 const LSR_THR_EMPTY: u8 = 0x60   // THRE and TEMT: ready to send
 const IIR_NONE: u8 = 0x01
 const IIR_THRE: u8 = 0x02
+const IIR_RDA: u8 = 0x04
 const MSR_IDLE: u8 = 0xb0        // DCD, DSR and CTS
+
+// The receive FIFO's size: a byte array's length must be a literal, so
+// Serial.rx spells it out.
+const FIFO_SIZE = 64
 
 const Serial = struct {
     ier: u8
@@ -37,11 +45,38 @@ const Serial = struct {
     dlh: u8
     // The THRE interrupt is pending: IIR reports it until it is read.
     thre: bool
-    // An edge to send on IRQ, taken by the VMM after the write.
+    // An edge to send on IRQ, taken by the VMM after the access.
     raise: bool
+    // Received bytes, rx_len of them from rx_head, waiting to be read.
+    rx: [64]u8
+    rx_head: i64
+    rx_len: i64
 
     fn init() Serial {
-        return Serial{ .ier = 0, .lcr = 0x03, .mcr = 0x08, .scr = 0, .dll = 0x0c, .dlh = 0, .thre = false, .raise = false }
+        return Serial{ .ier = 0, .lcr = 0x03, .mcr = 0x08, .scr = 0, .dll = 0x0c, .dlh = 0, .thre = false, .raise = false, .rx = @splat(0), .rx_head = 0, .rx_len = 0 }
+    }
+
+    // Room in the receive FIFO.
+    fn rx_room(self: Serial) i64 {
+        return FIFO_SIZE - self.rx_len
+    }
+
+    // A byte from the outside; false when the FIFO is full and it is not
+    // taken.
+    fn receive(inout self: Serial, v: u8) bool {
+        if (self.rx_len == FIFO_SIZE) {
+            return false
+        }
+        self.rx[(self.rx_head + self.rx_len) % FIFO_SIZE] = v
+        self.rx_len = self.rx_len + 1
+        self.data_ready()
+        return true
+    }
+
+    fn data_ready(inout self: Serial) void {
+        if (self.ier & IER_RDA != 0) {
+            self.raise = self.mcr & MCR_OUT2 != 0
+        }
     }
 
     fn owns(port: i64) bool {
@@ -68,10 +103,15 @@ const Serial = struct {
                 self.dlh = v
             } else {
                 const was = self.ier & IER_THRE != 0
+                const was_rda = self.ier & IER_RDA != 0
                 self.ier = v & 0x0f
+                if (!was_rda and self.rx_len > 0) {
+                    // Enabling it with data waiting raises it.
+                    self.data_ready()
+                }
                 if (self.ier & IER_THRE == 0) {
                     self.thre = false
-                    self.raise = false
+                    self.raise = self.raise and self.rx_len > 0 and self.ier & IER_RDA != 0
                 } else if (!was) {
                     // Enabling it with the transmitter empty raises it.
                     self.thr_empty()
@@ -108,14 +148,24 @@ const Serial = struct {
             if (dlab) {
                 return self.dll
             }
-            return 0
+            if (self.rx_len == 0) {
+                return 0
+            }
+            const v = self.rx[self.rx_head]
+            self.rx_head = (self.rx_head + 1) % FIFO_SIZE
+            self.rx_len = self.rx_len - 1
+            return v
         } else if (off == IER) {
             if (dlab) {
                 return self.dlh
             }
             return self.ier
         } else if (off == IIR) {
-            // Reading IIR when it reports THRE clears it.
+            // Received data comes first, until it is read. Reading IIR
+            // when it reports THRE clears it.
+            if (self.ier & IER_RDA != 0 and self.rx_len > 0) {
+                return IIR_RDA
+            }
             if (self.thre) {
                 self.thre = false
                 return IIR_THRE
@@ -126,6 +176,9 @@ const Serial = struct {
         } else if (off == MCR) {
             return self.mcr
         } else if (off == LSR) {
+            if (self.rx_len > 0) {
+                return LSR_THR_EMPTY | LSR_DATA_READY
+            }
             return LSR_THR_EMPTY
         } else if (off == MSR) {
             if (self.mcr & MCR_LOOP != 0) {

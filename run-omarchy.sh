@@ -4,7 +4,7 @@
 #
 #     ./run-omarchy.sh                 # default kernel command line
 #     ./run-omarchy.sh "console=ttyS0 reboot=k panic=1 pci=off loglevel=8"
-#     ./run-omarchy.sh --initramfs     # with a busybox initramfs (tools/mkinitramfs.sh)
+#     ./run-omarchy.sh --initramfs     # into a busybox shell (tools/mkinitramfs.sh); ^A x stops
 #
 # Overrides: OMARCHY_HOST (default femto@192.168.109.129), EGG_DIR (the Egg
 # compiler checkout, default ../egg), KERNEL (path on Omarchy).
