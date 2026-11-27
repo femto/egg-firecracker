@@ -1,0 +1,53 @@
+// Where the initramfs goes and what the zero page says about it, through
+// the code the VMM runs, on 1 MiB of guest memory in a buffer. Needs no KVM.
+uses io, alloc
+allow unsafe
+const kvm = @import("firecracker/kvm")
+const boot = @import("firecracker/boot")
+
+const MEM = 0x100000
+const KERNEL_END: u64 = 0x80000
+
+fn place(io: Io, a: Allocator, mem: kvm.GuestMemory, end: u64, size: i64) void {
+    const image = a.alloc(size, @as(u8, 0x5a))
+    defer a.free(image)
+    const kernel = boot.Kernel{ .entry = 0, .end = end }
+    const addr = boot.load_initrd(mem, kernel, image[0..]) catch |e| {
+        io.print(size, " bytes above ", end, ": ", @errorName(e))
+        return
+    }
+    const first = mem.read_u8(addr) catch 0
+    const last = mem.read_u8(addr + @as(u64, size) - 1) catch 0
+    io.print(size, " bytes above ", end, ": at ", addr, ", first ", first, ", last ", last)
+}
+
+fn zero_page_u32(mem: kvm.GuestMemory, off: u64) u64 {
+    var v: u64 = 0
+    var i: u64 = 0
+    while (i < 4) {
+        const b = mem.read_u8(0x7000 + off + i) catch 0
+        v = v | (@as(u64, b) << (i * 8))
+        i = i + 1
+    }
+    return v
+}
+
+fn main(io: Io, a: Allocator) !void {
+    const buf = a.alloc(MEM, @as(u8, 0))
+    defer a.free(buf)
+    const mem = kvm.GuestMemory{ .base = @bufPtr(buf), .gpa = 0, .size = MEM }
+
+    // Rounded down to a page from the top of memory.
+    place(io, a, mem, KERNEL_END, 5000)
+    // Exactly the space above the kernel.
+    place(io, a, mem, KERNEL_END, MEM - 0x80000)
+    // One byte more.
+    place(io, a, mem, KERNEL_END, MEM - 0x80000 + 1)
+    // Fits unaligned, but rounding down to a page reaches into the kernel.
+    place(io, a, mem, KERNEL_END + 1, MEM - 0x80000 - 1)
+
+    try boot.write_boot_data(mem, a, "console=ttyS0", 0xfe000, 5000)
+    io.print("ramdisk_image ", zero_page_u32(mem, 0x218), ", ramdisk_size ", zero_page_u32(mem, 0x21c))
+    try boot.write_boot_data(mem, a, "console=ttyS0", 0, 0)
+    io.print("without: ramdisk_image ", zero_page_u32(mem, 0x218), ", ramdisk_size ", zero_page_u32(mem, 0x21c))
+}

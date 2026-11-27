@@ -1,5 +1,8 @@
-// An 8250 UART at 0x3f8 (ttyS0), output only: enough for the kernel to find
-// it and print to it by polling. No interrupts and no input yet.
+// An 8250 UART at 0x3f8 (ttyS0), output only. The kernel's console prints
+// by polling it; the tty driver, which carries what user space writes,
+// sends a byte each time the transmitter-empty (THRE) interrupt arrives on
+// IRQ 4. A byte written is sent at once, so the transmitter is always
+// empty. No input yet.
 
 const BASE = 0x3f8
 const PORTS = 8
@@ -14,10 +17,15 @@ const LSR = 5
 const MSR = 6
 const SCR = 7
 
+const IRQ: u64 = 4
+
+const IER_THRE: u8 = 0x02
 const LCR_DLAB: u8 = 0x80
+const MCR_OUT2: u8 = 0x08        // gates the IRQ on PC UARTs
 const MCR_LOOP: u8 = 0x10
 const LSR_THR_EMPTY: u8 = 0x60   // THRE and TEMT: ready to send
 const IIR_NONE: u8 = 0x01
+const IIR_THRE: u8 = 0x02
 const MSR_IDLE: u8 = 0xb0        // DCD, DSR and CTS
 
 const Serial = struct {
@@ -27,9 +35,13 @@ const Serial = struct {
     scr: u8
     dll: u8
     dlh: u8
+    // The THRE interrupt is pending: IIR reports it until it is read.
+    thre: bool
+    // An edge to send on IRQ, taken by the VMM after the write.
+    raise: bool
 
     fn init() Serial {
-        return Serial{ .ier = 0, .lcr = 0x03, .mcr = 0x08, .scr = 0, .dll = 0x0c, .dlh = 0 }
+        return Serial{ .ier = 0, .lcr = 0x03, .mcr = 0x08, .scr = 0, .dll = 0x0c, .dlh = 0, .thre = false, .raise = false }
     }
 
     fn owns(port: i64) bool {
@@ -43,14 +55,27 @@ const Serial = struct {
         if (off == DATA) {
             if (dlab) {
                 self.dll = v
-            } else if (self.mcr & MCR_LOOP == 0) {
-                return @as(i64, v)
+            } else {
+                // Sent (or, in loopback, dropped): the transmitter is
+                // empty again.
+                self.thr_empty()
+                if (self.mcr & MCR_LOOP == 0) {
+                    return @as(i64, v)
+                }
             }
         } else if (off == IER) {
             if (dlab) {
                 self.dlh = v
             } else {
+                const was = self.ier & IER_THRE != 0
                 self.ier = v & 0x0f
+                if (self.ier & IER_THRE == 0) {
+                    self.thre = false
+                    self.raise = false
+                } else if (!was) {
+                    // Enabling it with the transmitter empty raises it.
+                    self.thr_empty()
+                }
             }
         } else if (off == LCR) {
             self.lcr = v
@@ -62,7 +87,21 @@ const Serial = struct {
         return -1
     }
 
-    fn read(self: Serial, port: i64) u8 {
+    fn thr_empty(inout self: Serial) void {
+        if (self.ier & IER_THRE != 0) {
+            self.thre = true
+            self.raise = self.mcr & MCR_OUT2 != 0
+        }
+    }
+
+    // Whether to send an edge on IRQ now; clears it.
+    fn take_irq(inout self: Serial) bool {
+        const r = self.raise
+        self.raise = false
+        return r
+    }
+
+    fn read(inout self: Serial, port: i64) u8 {
         const off = port - BASE
         const dlab = self.lcr & LCR_DLAB != 0
         if (off == DATA) {
@@ -76,6 +115,11 @@ const Serial = struct {
             }
             return self.ier
         } else if (off == IIR) {
+            // Reading IIR when it reports THRE clears it.
+            if (self.thre) {
+                self.thre = false
+                return IIR_THRE
+            }
             return IIR_NONE
         } else if (off == LCR) {
             return self.lcr

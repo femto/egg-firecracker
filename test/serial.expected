@@ -1,0 +1,8 @@
+byte, THRE disabled: irq false, iir 1 then 1
+THRE enabled: irq true, iir 2 then 1
+enabled again: irq false, iir 1 then 1
+sent 65
+byte: irq true, iir 2 then 1
+raised, then disabled: irq false, iir 1 then 1
+OUT2 low: irq false, iir 2 then 1
+divisor latch write: irq false, iir 1 then 1

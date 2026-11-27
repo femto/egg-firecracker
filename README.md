@@ -28,9 +28,26 @@ $ firecracker vmlinux-6.18.62
 [vmm] the guest reset the machine (i8042) after 4848 ms and 47526 VM exits
 ```
 
+With `--initrd`, the initramfs goes at the top of guest memory, as in
+Firecracker, and the kernel runs its `/init`. The UART raises its
+transmitter-empty interrupt on IRQ 4, which the tty driver needs to send
+what user space writes. `tools/mkinitramfs.sh` builds a busybox initramfs
+whose `/init` prints what it finds and reboots, since the UART takes no
+input yet:
+
+```
+$ firecracker vmlinux-6.18.62 --initrd initramfs.cpio
+=== initramfs: /init is running (pid 1) ===
+Linux (none) 6.18.62+ #1 SMP PREEMPT_DYNAMIC ... x86_64 GNU/Linux
+...
+=== no serial input yet: rebooting ===
+[vmm] the guest reset the machine (i8042) after 3903 ms and 47029 VM exits
+```
+
 `test/real_mode.egg` is stage 0: a vCPU running 12 bytes of real-mode code.
 
-Next: virtio block, to mount a root file system and reach a shell.
+Next: virtio block, to mount a root file system, and serial input, to reach
+a shell.
 
 ## Running
 
@@ -40,9 +57,14 @@ compiler. Nested virtualization works, e.g. a Linux VM in VMware Fusion with
 
 ```bash
 eggc build --release src/main.egg -o build/firecracker
-./build/firecracker vmlinux [CMDLINE]
+./build/firecracker vmlinux [--initrd FILE] [CMDLINE]
+tools/mkinitramfs.sh build/initramfs.cpio   # a busybox initramfs for --initrd
 eggc run test/real_mode.egg --pkg firecracker=src
 ```
+
+`test/console.egg`, `test/initrd.egg` and `test/serial.egg` need no KVM.
+`run-omarchy.sh [--initramfs]` syncs this and the Egg compiler to a Linux
+VM over ssh, builds there and boots.
 
 ## Notes
 

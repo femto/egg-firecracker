@@ -1,8 +1,9 @@
 // Booting a Linux vmlinux in 64-bit mode, as Firecracker does: the kernel's
 // ELF segments at their physical addresses, a zero page (struct boot_params)
-// with the command line and the e820 memory map, identity-mapped page
-// tables for the first GiB, a GDT, and a vCPU already in long mode at the
-// ELF entry with rsi pointing at the zero page.
+// with the command line and the e820 memory map, an optional initramfs at
+// the top of memory, identity-mapped page tables for the first GiB, a GDT,
+// and a vCPU already in long mode at the ELF entry with rsi pointing at the
+// zero page.
 uses alloc
 const kvm = @import("kvm.egg")
 
@@ -22,15 +23,24 @@ const HIMEM_START: u64 = 0x100000
 const PT_LOAD: u64 = 1
 const E820_RAM: u64 = 1
 
+const PAGE_SIZE: u64 = 0x1000
+
 const X86_CR0_PE: u64 = 0x1
 const X86_CR0_PG: u64 = 0x80000000
 const X86_CR4_PAE: u64 = 0x20
 const EFER_LME: u64 = 0x100
 const EFER_LMA: u64 = 0x400
 
+// Where the kernel landed: its entry point, and the end of its highest
+// segment, bss included.
+const Kernel = struct {
+    entry: u64
+    end: u64
+}
+
 // Loads the PT_LOAD segments of the ELF64 x86_64 image at their physical
-// addresses and returns its entry point.
-fn load_elf(mem: kvm.GuestMemory, image: []u8) !u64 {
+// addresses.
+fn load_elf(mem: kvm.GuestMemory, image: []u8) !Kernel {
     if (@len(image) < 64 or image[0] != 0x7f or image[1] != 'E' or image[2] != 'L' or image[3] != 'F') {
         return error.NotElf
     }
@@ -46,6 +56,7 @@ fn load_elf(mem: kvm.GuestMemory, image: []u8) !u64 {
     if (phentsize < 56 or phoff > len or @as(u64, phnum * phentsize) > len - phoff) {
         return error.BadElf
     }
+    var end: u64 = 0
     var i = 0
     while (i < phnum) {
         const ph = @as(i64, phoff) + i * phentsize
@@ -53,8 +64,12 @@ fn load_elf(mem: kvm.GuestMemory, image: []u8) !u64 {
             const offset = kvm.le(image, ph + 8, 8)
             const paddr = kvm.le(image, ph + 0x18, 8)
             const filesz = kvm.le(image, ph + 0x20, 8)
-            if (offset > len or filesz > len - offset) {
+            const memsz = kvm.le(image, ph + 0x28, 8)
+            if (offset > len or filesz > len - offset or filesz > memsz or memsz > @as(u64, mem.size) or paddr > @as(u64, mem.size) - memsz) {
                 return error.BadElf
+            }
+            if (paddr + memsz > end) {
+                end = paddr + memsz
             }
             // The rest of memsz is bss, already zero in fresh guest memory.
             const start = @as(i64, offset)
@@ -62,11 +77,29 @@ fn load_elf(mem: kvm.GuestMemory, image: []u8) !u64 {
         }
         i = i + 1
     }
-    return entry
+    return Kernel{ .entry = entry, .end = end }
 }
 
-// The zero page, the command line, the page tables and the GDT.
-fn write_boot_data(mem: kvm.GuestMemory, a: Allocator, cmdline: str) !void {
+// Copies the initramfs to the top of guest memory, page aligned, as
+// Firecracker does, and returns its address. It must not reach down into
+// the kernel.
+fn load_initrd(mem: kvm.GuestMemory, kernel: Kernel, image: []u8) !u64 {
+    const len = @as(u64, @len(image))
+    const top = @as(u64, mem.size)
+    if (len > top or top - len < kernel.end) {
+        return error.InitrdTooBig
+    }
+    const addr = (top - len) / PAGE_SIZE * PAGE_SIZE
+    if (addr < kernel.end) {
+        return error.InitrdTooBig
+    }
+    try mem.write(addr, image)
+    return addr
+}
+
+// The zero page, the command line, the page tables and the GDT. An
+// initrd_size of 0 means no initramfs.
+fn write_boot_data(mem: kvm.GuestMemory, a: Allocator, cmdline: str, initrd_addr: u64, initrd_size: u64) !void {
     if (@len(cmdline) >= CMDLINE_MAX_SIZE) {
         return error.CmdlineTooLong
     }
@@ -83,6 +116,10 @@ fn write_boot_data(mem: kvm.GuestMemory, a: Allocator, cmdline: str) !void {
     kvm.put_le(&zp[0..], 0x228, 4, CMDLINE_START)   // hdr.cmd_line_ptr
     kvm.put_le(&zp[0..], 0x230, 4, 0x1000000)       // hdr.kernel_alignment
     kvm.put_le(&zp[0..], 0x238, 4, @as(u64, @len(cmdline)))  // hdr.cmdline_size
+    if (initrd_size > 0) {
+        kvm.put_le(&zp[0..], 0x218, 4, initrd_addr)     // hdr.ramdisk_image
+        kvm.put_le(&zp[0..], 0x21c, 4, initrd_size)     // hdr.ramdisk_size
+    }
     // e820: low memory below the EBDA, and everything from 1 MiB.
     kvm.put_le(&zp[0..], 0x1e8, 1, 2)               // e820_entries
     put_e820(&zp[0..], 0, 0, EBDA_START)

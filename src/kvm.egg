@@ -36,6 +36,7 @@ const KVM_CREATE_VCPU: u64 = 0xAE41
 const KVM_SET_USER_MEMORY_REGION: u64 = 0x4020AE46
 const KVM_SET_TSS_ADDR: u64 = 0xAE47
 const KVM_CREATE_IRQCHIP: u64 = 0xAE60
+const KVM_IRQ_LINE: u64 = 0x4008AE61
 const KVM_CREATE_PIT2: u64 = 0x4040AE77
 const KVM_RUN: u64 = 0xAE80
 const KVM_GET_REGS: u64 = 0x8090AE81
@@ -202,6 +203,22 @@ const Vm = struct {
         defer a.free(pit)
         put_le(&pit[0..], 0, 4, 1)
         _ = try ioctl_buf(self.fd, KVM_CREATE_PIT2, pit)
+    }
+
+    // Sets an interrupt line of the in-kernel PIC and IOAPIC high or low.
+    fn irq_line(self: Vm, a: Allocator, irq: u64, level: u64) !void {
+        // struct kvm_irq_level: irq, level
+        var b = a.alloc(8, @as(u8, 0))
+        defer a.free(b)
+        put_le(&b[0..], 0, 4, irq)
+        put_le(&b[0..], 4, 4, level)
+        _ = try ioctl_buf(self.fd, KVM_IRQ_LINE, b)
+    }
+
+    // An edge on an ISA interrupt line, as the UART's IRQ is.
+    fn irq_pulse(self: Vm, a: Allocator, irq: u64) !void {
+        try self.irq_line(a, irq, 1)
+        try self.irq_line(a, irq, 0)
     }
 
     // Anonymous memory of size bytes, seen by the guest at gpa.

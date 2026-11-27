@@ -1,0 +1,6 @@
+5000 bytes above 524288: at 1040384, first 90, last 90
+524288 bytes above 524288: at 524288, first 90, last 90
+524289 bytes above 524288: InitrdTooBig
+524287 bytes above 524289: InitrdTooBig
+ramdisk_image 1040384, ramdisk_size 5000
+without: ramdisk_image 0, ramdisk_size 0

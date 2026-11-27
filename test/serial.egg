@@ -1,0 +1,40 @@
+// The UART's transmitter-empty (THRE) interrupt, which the tty driver waits
+// for before each byte user space writes. Needs no KVM.
+uses io
+const serial = @import("firecracker/serial")
+
+const THR = 0x3f8
+const IER = 0x3f9
+const IIR = 0x3fa
+const LCR = 0x3fb
+const MCR = 0x3fc
+
+fn show(io: Io, inout u: serial.Serial, what: str) void {
+    const irq = u.take_irq()
+    const iir = u.read(IIR)
+    const again = u.read(IIR)
+    io.print(what, ": irq ", irq, ", iir ", iir, " then ", again)
+}
+
+fn main(io: Io) void {
+    var u = serial.Serial.init()
+    _ = u.write(THR, 'x')
+    show(io, &u, "byte, THRE disabled")
+    _ = u.write(IER, 0x02)
+    show(io, &u, "THRE enabled")
+    _ = u.write(IER, 0x03)
+    show(io, &u, "enabled again")
+    io.print("sent ", u.write(THR, 'A'))
+    show(io, &u, "byte")
+    _ = u.write(IER, 0x00)
+    _ = u.write(IER, 0x02)
+    _ = u.write(IER, 0x00)
+    show(io, &u, "raised, then disabled")
+    _ = u.write(MCR, 0x00)
+    _ = u.write(IER, 0x02)
+    show(io, &u, "OUT2 low")
+    _ = u.write(MCR, 0x08)
+    _ = u.write(LCR, 0x83)
+    _ = u.write(THR, 0x0c)
+    show(io, &u, "divisor latch write")
+}
