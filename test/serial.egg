@@ -72,6 +72,13 @@ fn main(io: Io) void {
     _ = u.write(MCR, 0x08)
     io.print("OUT2 opened: irq ", u.take_irq(), ", iir ", u.read(IIR))
     _ = u.read(THR)
+    // Enabling only the received-data interrupt, with the FIFO empty,
+    // sends an edge: input may be waiting outside it.
+    _ = u.write(IER, 0x00)
+    _ = u.write(IER, 0x01)
+    io.print("RDA alone, FIFO empty: irq ", u.take_irq())
+    _ = u.write(IER, 0x03)
+    _ = u.take_irq()
     // Input comes in on reads of RBR, IIR and LSR, not IER (which the
     // kernel's probe writes and reads back), nor the divisor latch.
     io.print("takes input: rbr ", u.reads_rx(THR), ", iir ", u.reads_rx(IIR), ", lsr ", u.reads_rx(LSR), ", ier ", u.reads_rx(IER))

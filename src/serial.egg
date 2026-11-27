@@ -117,17 +117,17 @@ const Serial = struct {
                 const was = self.ier & IER_THRE != 0
                 const was_rda = self.ier & IER_RDA != 0
                 self.ier = v & 0x0f
-                if (!was_rda and self.ier & IER_RDA != 0) {
-                    // Input may be waiting outside the FIFO: an edge, and
-                    // the handler's read of IIR brings it in.
-                    self.data_ready()
-                }
                 if (self.ier & IER_THRE == 0) {
                     self.thre = false
                     self.raise = self.raise and self.rx_len > 0 and self.ier & IER_RDA != 0
                 } else if (!was) {
                     // Enabling it with the transmitter empty raises it.
                     self.thr_empty()
+                }
+                if (!was_rda and self.ier & IER_RDA != 0) {
+                    // Input may be waiting outside the FIFO: an edge, and
+                    // the handler's read of IIR brings it in.
+                    self.data_ready()
                 }
             }
         } else if (off == LCR) {

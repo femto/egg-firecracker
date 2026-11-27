@@ -16,6 +16,7 @@ after the data: irq false, iir 2 then 1
 one more: irq true
 data behind OUT2: irq false
 OUT2 opened: irq true, iir 4
+RDA alone, FIFO empty: irq true
 takes input: rbr true, iir true, lsr true, ier false
 with DLAB: rbr false
 FIFO took 64, room 0
