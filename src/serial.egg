@@ -154,6 +154,14 @@ const Serial = struct {
         }
     }
 
+    // Whether the received-data interrupt can reach the guest: enabled in
+    // IER, with OUT2 open. Until it can, an edge on IRQ 4 is one the guest
+    // never asked for (early in boot, before the interrupt controllers are
+    // set up, it arrives as vector 4, an overflow exception).
+    fn rx_irq_on(self: Serial) bool {
+        return self.ier & IER_RDA != 0 and self.mcr & MCR_OUT2 != 0
+    }
+
     // Whether to send an edge on IRQ now; clears it.
     fn take_irq(inout self: Serial) bool {
         const r = self.raise

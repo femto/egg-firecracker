@@ -128,7 +128,11 @@ fn run(io: Io, files: Fs, a: Allocator, threads: Threads, kernel: str, initrd: s
     const live = @len(saved) > 0
     const rx = threads.channel(u8, 4096)
     defer rx.close()
-    threads.spawn(input.run, rx.sender(), io, a, vm, a.concat(saved, "")).detach()
+    // Whether the guest has the UART's received-data interrupt on: set by
+    // this thread, read by the input thread before it raises IRQ 4.
+    const rx_on = threads.atomic(0)
+    defer rx_on.close()
+    threads.spawn(input.run, rx.sender(), rx_on.clone(), io, a, vm, a.concat(saved, "")).detach()
     if (live) {
         io.eprint("[vmm] the console takes the keyboard: ^A x stops")
     }
@@ -143,6 +147,11 @@ fn run(io: Io, files: Fs, a: Allocator, threads: Threads, kernel: str, initrd: s
         if (exit.reason == kvm.EXIT_IO and exit.write) {
             if (serial.Serial.owns(exit.port)) {
                 try console.out(io, a, &uart, &line, vcpu, exit, live)
+                if (uart.rx_irq_on()) {
+                    rx_on.store(1)
+                } else {
+                    rx_on.store(0)
+                }
                 if (uart.take_irq()) {
                     try vm.irq_pulse(a, serial.IRQ)
                 }

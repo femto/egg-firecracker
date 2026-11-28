@@ -94,6 +94,17 @@ fn main(io: Io) void {
     _ = u.write(LCR, 0x83)
     io.print("with DLAB: rbr ", u.reads_rx(THR))
     _ = u.write(LCR, 0x03)
+    // The received-data interrupt can reach the guest only enabled, with
+    // OUT2 open.
+    _ = u.write(IER, 0x00)
+    io.print("rx irq: IER 0 ", u.rx_irq_on())
+    _ = u.write(IER, 0x01)
+    _ = u.write(MCR, 0x00)
+    io.print("rx irq: RDA, OUT2 low ", u.rx_irq_on())
+    _ = u.write(MCR, 0x08)
+    io.print("rx irq: RDA, OUT2 high ", u.rx_irq_on())
+    _ = u.write(IER, 0x03)
+    _ = u.take_irq()
     // The FIFO holds 64.
     var n = 0
     while (u.receive('z')) {
