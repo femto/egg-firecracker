@@ -8,7 +8,9 @@
 uses fs, alloc, io
 allow unsafe
 
-extern fn open(path: *u8, flags: i32) i32 uses fs
+// open is variadic in C; its mode, used only with O_CREAT, is passed as a
+// third integer argument, as x86_64 passes it.
+extern fn open(path: *u8, flags: i32, mode: u32) i32 uses fs
 extern fn close(fd: i32) i32 uses fs
 // ioctl is variadic in C; every KVM request here passes one integer or
 // pointer argument, which the x86_64 calling convention passes the same way.
@@ -24,8 +26,32 @@ extern fn isatty(fd: i32) i32 uses io
 extern fn tcgetattr(fd: i32, t: *u8) i32 uses io
 extern fn tcsetattr(fd: i32, when: i32, t: *u8) i32 uses io
 extern fn _exit(code: i32) void uses io
+// A disk image, read and written straight between the file and guest
+// memory.
+extern fn pread(fd: i32, buf: *u8, n: usize, off: i64) i64 uses fs
+extern fn pwrite(fd: i32, buf: *u8, n: usize, off: i64) i64 uses fs
+extern fn fsync(fd: i32) i32 uses fs
+extern fn flock(fd: i32, op: i32) i32 uses fs
+// For a temporary disk: mkstemp is in <stdlib.h>, which Egg's C includes,
+// with a char * that a *u8 here would clash with. uname tells which
+// system's open flags to use, as the tests run on macOS too.
+extern fn getpid() i32 uses fs
+extern fn uname(buf: *u8) i32 uses fs
+// fcntl is variadic; F_GETFD takes no third argument, and 0 is passed.
+extern fn fcntl(fd: i32, cmd: i32, arg: i32) i32 uses fs
+extern fn unlink(path: *u8) i32 uses fs
+extern fn ftruncate(fd: i32, len: i64) i32 uses fs
 
 const O_RDWR: i32 = 2
+const O_CREAT_LINUX: i32 = 0x40
+const O_EXCL_LINUX: i32 = 0x80
+const O_CREAT_BSD: i32 = 0x200
+const O_EXCL_BSD: i32 = 0x800
+const O_CLOEXEC_BSD: i32 = 0x1000000
+const F_GETFD: i32 = 1
+const FD_CLOEXEC: i32 = 1
+const LOCK_EX: i32 = 2
+const LOCK_NB: i32 = 4
 const O_CLOEXEC: i32 = 0x80000
 const PROT_RW: i32 = 3
 const MAP_SHARED: i32 = 0x01
@@ -228,11 +254,115 @@ fn exit_now(code: i32) void {
     _exit(code)
 }
 
+// Whether this is Linux: struct utsname starts with sysname, NUL-ended,
+// on Linux and macOS alike.
+fn on_linux(a: Allocator) bool {
+    const u = a.alloc(2048, @as(u8, 0))
+    defer a.free(u)
+    if (uname(@bufPtr(u)) < 0) {
+        return true
+    }
+    return u[0] == 'L' and u[1] == 'i' and u[2] == 'n' and u[3] == 'u' and u[4] == 'x' and u[5] == 0
+}
+
+// A disk image open for reading and writing, of size bytes.
+const Disk = struct {
+    fd: i32
+    size: u64
+
+    // Locked for this process alone: two guests writing one file system
+    // image would corrupt it.
+    fn open_path(a: Allocator, path: str) !Disk {
+        const fd = try sys(open(a.cstr(path), O_RDWR | O_CLOEXEC, 0))
+        errdefer close_fd(fd)
+        if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+            return error.DiskInUse
+        }
+        const size = lseek(fd, 0, SEEK_END_)
+        if (size < 0) {
+            return error.DiskFailed
+        }
+        return Disk{ .fd = fd, .size = @as(u64, size) }
+    }
+
+    // A disk of size bytes, all zero, in a temporary file already
+    // unlinked: for tests.
+    fn temp(a: Allocator, size: i64) !Disk {
+        var name = a.concat("/tmp/egg-firecracker-disk-", "")
+        a.append_int(&name, getpid())
+        const path = a.cstr(a.leak(name))
+        a.free(name)
+        // One exclusive create: an existing file or symlink at the path
+        // makes it fail, rather than be opened or truncated.
+        var create = O_CREAT_LINUX | O_EXCL_LINUX | O_CLOEXEC
+        if (!on_linux(a)) {
+            create = O_CREAT_BSD | O_EXCL_BSD | O_CLOEXEC_BSD
+        }
+        const fd = try sys(open(path, O_RDWR | create, 0x180))   // 0600
+        _ = unlink(path)
+        errdefer close_fd(fd)
+        _ = try sys(ftruncate(fd, size))
+        return Disk{ .fd = fd, .size = @as(u64, size) }
+    }
+
+    // Whether the descriptor closes on exec: F_GETFD and FD_CLOEXEC are
+    // the same on Linux and macOS.
+    fn close_on_exec(self: Disk) bool {
+        return fcntl(self.fd, F_GETFD, 0) & FD_CLOEXEC != 0
+    }
+
+    fn close(self: Disk) void {
+        close_fd(self.fd)
+    }
+
+    // len bytes of the disk from off into guest memory at addr.
+    fn read_into(self: Disk, mem: GuestMemory, addr: u64, len: i64, off: u64) !void {
+        const start = mem.offset(addr, len)
+        if (start < 0) {
+            return error.OutOfGuestMemory
+        }
+        if (off > self.size or @as(u64, len) > self.size - off) {
+            return error.OutOfDisk
+        }
+        var done = 0
+        while (done < len) {
+            const n = pread(self.fd, @ptrAdd(mem.base, start + done), @as(usize, len - done), @as(i64, off) + done)
+            if (n <= 0) {
+                return error.DiskFailed
+            }
+            done = done + n
+        }
+    }
+
+    // len bytes of guest memory at addr onto the disk from off.
+    fn write_from(self: Disk, mem: GuestMemory, addr: u64, len: i64, off: u64) !void {
+        const start = mem.offset(addr, len)
+        if (start < 0) {
+            return error.OutOfGuestMemory
+        }
+        if (off > self.size or @as(u64, len) > self.size - off) {
+            return error.OutOfDisk
+        }
+        var done = 0
+        while (done < len) {
+            const n = pwrite(self.fd, @ptrAdd(mem.base, start + done), @as(usize, len - done), @as(i64, off) + done)
+            if (n <= 0) {
+                return error.DiskFailed
+            }
+            done = done + n
+        }
+    }
+
+    fn sync(self: Disk) !void {
+        _ = try sys(fsync(self.fd))
+    }
+}
+
 // The whole file at path. Through open and mmap rather than the fs
 // capability: using that makes the generated C include <fcntl.h>, whose
 // open (variadic, const char *) clashes with the extern fn above.
 fn read_file(a: Allocator, path: str) !Buf(u8) {
-    const fd = try sys(open(a.cstr(path), O_CLOEXEC))   // O_RDONLY
+    const fd = try sys(open(a.cstr(path), O_CLOEXEC, 0))   // O_RDONLY
     defer close_fd(fd)
     const size = lseek(fd, 0, SEEK_END_)
     if (size <= 0) {
@@ -253,7 +383,7 @@ const Kvm = struct {
     fd: i32
 
     fn init(a: Allocator) !Kvm {
-        const fd = try sys(open(a.cstr("/dev/kvm"), O_RDWR | O_CLOEXEC))
+        const fd = try sys(open(a.cstr("/dev/kvm"), O_RDWR | O_CLOEXEC, 0))
         const kvm = Kvm{ .fd = fd }
         if (try sys(ioctl(fd, KVM_GET_API_VERSION, 0)) != KVM_API_VERSION) {
             return error.KvmApiVersion
@@ -359,6 +489,35 @@ const GuestMemory = struct {
         var i = 0
         while (i < @len(bytes)) {
             @ptrAdd(self.base, off + i).* = bytes[i]
+            i = i + 1
+        }
+    }
+
+    // n bytes (1 to 8), little-endian, at addr.
+    fn read_le(self: GuestMemory, addr: u64, n: i64) !u64 {
+        const off = self.offset(addr, n)
+        if (off < 0 or n > 8) {
+            return error.OutOfGuestMemory
+        }
+        var v: u64 = 0
+        var i = n - 1
+        while (i >= 0) {
+            v = (v << 8) | @as(u64, @ptrAdd(self.base, off + i).*)
+            i = i - 1
+        }
+        return v
+    }
+
+    fn write_le(self: GuestMemory, addr: u64, n: i64, v: u64) !void {
+        const off = self.offset(addr, n)
+        if (off < 0 or n > 8) {
+            return error.OutOfGuestMemory
+        }
+        var x = v
+        var i = 0
+        while (i < n) {
+            @ptrAdd(self.base, off + i).* = @as(u8, x & 0xff)
+            x = x >> 8
             i = i + 1
         }
     }

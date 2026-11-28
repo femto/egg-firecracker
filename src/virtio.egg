@@ -1,0 +1,516 @@
+// A virtio block device on the virtio-mmio transport (version 2), as in
+// Firecracker: one region of registers below 4 GiB, one interrupt line,
+// one split virtqueue. The kernel finds it in the ACPI tables' DSDT
+// (acpi.egg), at Firecracker's address for its first device.
+//
+// The queue's descriptor table and rings are in guest memory, written by
+// the guest: every address, length, index and chain is checked, and a
+// request that fails a check fails alone, never the VMM. Requests are
+// served when the guest writes QueueNotify, while its vCPU waits on that
+// exit, then the device raises its interrupt.
+uses fs
+const kvm = @import("kvm.egg")
+
+const MMIO_BASE: u64 = 0xc0000000
+const MMIO_SIZE: u64 = 0x1000
+const IRQ: u64 = 5
+
+// Registers, as offsets in the region.
+const MAGIC_VALUE: u64 = 0x000
+const VERSION: u64 = 0x004
+const DEVICE_ID: u64 = 0x008
+const VENDOR_ID: u64 = 0x00c
+const DEVICE_FEATURES: u64 = 0x010
+const DEVICE_FEATURES_SEL: u64 = 0x014
+const DRIVER_FEATURES: u64 = 0x020
+const DRIVER_FEATURES_SEL: u64 = 0x024
+const QUEUE_SEL: u64 = 0x030
+const QUEUE_NUM_MAX: u64 = 0x034
+const QUEUE_NUM: u64 = 0x038
+const QUEUE_READY: u64 = 0x044
+const QUEUE_NOTIFY: u64 = 0x050
+const INTERRUPT_STATUS: u64 = 0x060
+const INTERRUPT_ACK: u64 = 0x064
+const STATUS: u64 = 0x070
+const QUEUE_DESC_LOW: u64 = 0x080
+const QUEUE_DESC_HIGH: u64 = 0x084
+const QUEUE_DRIVER_LOW: u64 = 0x090
+const QUEUE_DRIVER_HIGH: u64 = 0x094
+const QUEUE_DEVICE_LOW: u64 = 0x0a0
+const QUEUE_DEVICE_HIGH: u64 = 0x0a4
+const CONFIG_GENERATION: u64 = 0x0fc
+const CONFIG: u64 = 0x100
+
+const MAGIC: u64 = 0x74726976          // "virt"
+const DEVICE_BLOCK: u64 = 2
+const VENDOR: u64 = 0x45474721         // "!GGE"
+
+const F_BLK_FLUSH: u64 = 1 << 9
+const F_VERSION_1: u64 = 1 << 32
+const FEATURES: u64 = F_BLK_FLUSH | F_VERSION_1
+
+const S_FEATURES_OK: u64 = 8
+const S_DRIVER_OK: u64 = 4
+
+const INT_USED_BUFFER: u64 = 1
+
+const QUEUE_MAX: u64 = 256
+
+// struct virtq_desc: addr (u64), len (u32), flags (u16), next (u16)
+const DESC_SIZE: u64 = 16
+const DESC_F_NEXT: u64 = 1
+const DESC_F_WRITE: u64 = 2
+
+// struct virtio_blk_req: type (u32), reserved (u32), sector (u64), then
+// the data, then a status byte.
+const REQ_HEADER: u64 = 16
+const T_IN: u64 = 0
+const T_OUT: u64 = 1
+const T_FLUSH: u64 = 4
+const T_GET_ID: u64 = 8
+const BLK_S_OK: u64 = 0
+const BLK_S_IOERR: u64 = 1
+const BLK_S_UNSUPP: u64 = 2
+const SECTOR_SIZE: u64 = 512
+const U64_MAX: u64 = 0xffffffffffffffff
+const ID = "egg-firecracker"   // at most 20 bytes, VIRTIO_BLK_ID_BYTES
+
+const Blk = struct {
+    disk: kvm.Disk
+    status: u64
+    device_features_sel: u64
+    driver_features: u64
+    driver_features_sel: u64
+    queue_sel: u64
+    // Queue 0, the only one.
+    num: u64
+    ready: bool
+    desc: u64
+    avail: u64
+    used: u64
+    // The next avail ring entry to serve, and the used ring's index.
+    last_avail: u64
+    used_idx: u64
+    interrupt_status: u64
+
+    fn init(disk: kvm.Disk) Blk {
+        return Blk{ .disk = disk, .status = 0, .device_features_sel = 0, .driver_features = 0, .driver_features_sel = 0, .queue_sel = 0, .num = 0, .ready = false, .desc = 0, .avail = 0, .used = 0, .last_avail = 0, .used_idx = 0, .interrupt_status = 0 }
+    }
+
+    // No device: its region is not there.
+    fn none() Blk {
+        return Blk.init(kvm.Disk{ .fd = -1, .size = 0 })
+    }
+
+    fn owns(self: Blk, addr: u64) bool {
+        return self.disk.fd >= 0 and addr >= MMIO_BASE and addr < MMIO_BASE + MMIO_SIZE
+    }
+
+    // Back to the state before the driver found it; the disk stays.
+    fn reset(inout self: Blk) void {
+        self = Blk.init(self.disk)
+    }
+
+    // The interrupt line, level-triggered: high while InterruptStatus has
+    // a bit the driver has not acknowledged.
+    fn line(self: Blk) bool {
+        return self.interrupt_status != 0
+    }
+
+    // A read of size bytes at addr in the region. Registers are read 4
+    // bytes at a time; the configuration space at any width.
+    fn read(self: Blk, addr: u64, size: i64) u64 {
+        const off = addr - MMIO_BASE
+        if (off >= CONFIG) {
+            return self.read_config(off - CONFIG, size)
+        }
+        if (size != 4) {
+            return 0
+        }
+        if (off == MAGIC_VALUE) {
+            return MAGIC
+        } else if (off == VERSION) {
+            return 2
+        } else if (off == DEVICE_ID) {
+            return DEVICE_BLOCK
+        } else if (off == VENDOR_ID) {
+            return VENDOR
+        } else if (off == DEVICE_FEATURES) {
+            if (self.device_features_sel == 0) {
+                return FEATURES & 0xffffffff
+            } else if (self.device_features_sel == 1) {
+                return FEATURES >> 32
+            }
+            return 0
+        } else if (off == QUEUE_NUM_MAX) {
+            if (self.queue_sel == 0) {
+                return QUEUE_MAX
+            }
+            return 0
+        } else if (off == QUEUE_READY) {
+            if (self.queue_sel == 0 and self.ready) {
+                return 1
+            }
+            return 0
+        } else if (off == INTERRUPT_STATUS) {
+            return self.interrupt_status
+        } else if (off == STATUS) {
+            return self.status
+        } else if (off == CONFIG_GENERATION) {
+            return 0
+        }
+        return 0
+    }
+
+    // struct virtio_blk_config: capacity in 512-byte sectors (u64) first;
+    // the rest, for features not offered, reads as zero.
+    fn read_config(self: Blk, off: u64, size: i64) u64 {
+        const capacity = self.disk.size / SECTOR_SIZE
+        var v: u64 = 0
+        var i: u64 = 0
+        while (i < @as(u64, size) and i < 8) {
+            const at = off + i
+            if (at < 8) {
+                v = v | (((capacity >> (at * 8)) & 0xff) << (i * 8))
+            }
+            i = i + 1
+        }
+        return v
+    }
+
+    // A write of size bytes at addr in the region; QueueNotify serves the
+    // queue there and then.
+    fn write(inout self: Blk, mem: kvm.GuestMemory, addr: u64, size: i64, v: u64) void {
+        const off = addr - MMIO_BASE
+        if (size != 4 or off >= CONFIG) {
+            return
+        }
+        if (off == DEVICE_FEATURES_SEL) {
+            self.device_features_sel = v
+        } else if (off == DRIVER_FEATURES) {
+            if (self.driver_features_sel == 0) {
+                self.driver_features = (self.driver_features & 0xffffffff00000000) | v
+            } else if (self.driver_features_sel == 1) {
+                self.driver_features = (self.driver_features & 0xffffffff) | (v << 32)
+            }
+        } else if (off == DRIVER_FEATURES_SEL) {
+            self.driver_features_sel = v
+        } else if (off == QUEUE_SEL) {
+            self.queue_sel = v
+        } else if (off == STATUS) {
+            self.set_status(v)
+        } else if (off == INTERRUPT_ACK) {
+            self.interrupt_status = self.interrupt_status & ~v
+        } else if (off == QUEUE_NOTIFY) {
+            if (v == 0 and self.status & S_DRIVER_OK != 0 and self.ready) {
+                self.serve(mem)
+            }
+        } else if (self.queue_sel == 0 and !self.ready) {
+            // The queue's setup, while it is not in use.
+            if (off == QUEUE_NUM) {
+                self.num = v
+            } else if (off == QUEUE_READY) {
+                self.ready = v == 1 and self.queue_ok(mem)
+            } else if (off == QUEUE_DESC_LOW) {
+                self.desc = (self.desc & 0xffffffff00000000) | v
+            } else if (off == QUEUE_DESC_HIGH) {
+                self.desc = (self.desc & 0xffffffff) | (v << 32)
+            } else if (off == QUEUE_DRIVER_LOW) {
+                self.avail = (self.avail & 0xffffffff00000000) | v
+            } else if (off == QUEUE_DRIVER_HIGH) {
+                self.avail = (self.avail & 0xffffffff) | (v << 32)
+            } else if (off == QUEUE_DEVICE_LOW) {
+                self.used = (self.used & 0xffffffff00000000) | v
+            } else if (off == QUEUE_DEVICE_HIGH) {
+                self.used = (self.used & 0xffffffff) | (v << 32)
+            }
+        } else if (off == QUEUE_READY and self.queue_sel == 0 and v == 0) {
+            self.ready = false
+        }
+    }
+
+    // 0 resets; FEATURES_OK sticks only for features offered, VERSION_1
+    // among them, so the driver reading it back sees a refusal.
+    fn set_status(inout self: Blk, v: u64) void {
+        if (v == 0) {
+            self.reset()
+            return
+        }
+        var s = v
+        if (s & S_FEATURES_OK != 0 and self.status & S_FEATURES_OK == 0) {
+            if (self.driver_features & ~FEATURES != 0 or self.driver_features & F_VERSION_1 == 0) {
+                s = s & ~S_FEATURES_OK
+            }
+        }
+        self.status = s
+    }
+
+    // A split virtqueue's size is a power of 2, at most QUEUE_MAX, and its
+    // descriptor table and rings lie in guest memory: once the queue is
+    // ready they stay put, so writing a request's completion cannot fail
+    // after its disk I/O is done.
+    fn queue_ok(self: Blk, mem: kvm.GuestMemory) bool {
+        if (self.num == 0 or self.num > QUEUE_MAX or self.num & (self.num - 1) != 0) {
+            return false
+        }
+        const n = @as(i64, self.num)
+        // virtq_avail and virtq_used: flags, idx, the ring, then an event
+        // index.
+        return mem.offset(self.desc, n * 16) >= 0 and mem.offset(self.avail, 6 + n * 2) >= 0 and mem.offset(self.used, 6 + n * 8) >= 0
+    }
+
+    // Every request the guest has made available, each answered in the
+    // used ring; the interrupt status then says so.
+    fn serve(inout self: Blk, mem: kvm.GuestMemory) void {
+        const avail_idx = mem.read_le(self.avail + 2, 2) catch {
+            return
+        }
+        // The avail index runs at most a queue ahead of the device; more
+        // is a broken driver, and nothing is served. Both are 16-bit and
+        // wrap, so the distance is taken modulo 2^16.
+        if ((avail_idx + 0x10000 - self.last_avail) & 0xffff > self.num) {
+            return
+        }
+        var served = false
+        while (self.last_avail != avail_idx) {
+            const slot = self.avail + 4 + 2 * (self.last_avail % self.num)
+            const head = mem.read_le(slot, 2) catch {
+                return
+            }
+            const written = self.request(mem, head)
+            const entry = self.used + 4 + 8 * (self.used_idx % self.num)
+            mem.write_le(entry, 4, head) catch {
+                return
+            }
+            mem.write_le(entry + 4, 4, written) catch {
+                return
+            }
+            self.used_idx = (self.used_idx + 1) & 0xffff
+            mem.write_le(self.used + 2, 2, self.used_idx) catch {
+                return
+            }
+            self.last_avail = (self.last_avail + 1) & 0xffff
+            served = true
+        }
+        if (served) {
+            self.interrupt_status = self.interrupt_status | INT_USED_BUFFER
+        }
+    }
+
+    fn desc_at(self: Blk, mem: kvm.GuestMemory, i: u64) Desc {
+        const at = self.desc + i * DESC_SIZE
+        const addr = mem.read_le(at, 8) catch 0
+        const len = mem.read_le(at + 8, 4) catch 0
+        const flags = mem.read_le(at + 12, 2) catch 0
+        const next = mem.read_le(at + 14, 2) catch 0
+        return Desc{ .addr = addr, .len = len, .flags = flags, .next = next }
+    }
+
+    // One request, from the descriptor chain at head; the number of bytes
+    // written into the guest's buffers. The chain is two byte streams,
+    // device-readable first, then device-writable: the readable stream
+    // holds the 16-byte header and, for a write, the data; the writable
+    // one the data of a read or the id, and the status byte last. However
+    // the driver cuts them into descriptors.
+    fn request(self: Blk, mem: kvm.GuestMemory, head: u64) u64 {
+        if (head >= self.num) {
+            return 0
+        }
+        // The chain: its length, each stream's size, and readable before
+        // writable. A chain longer than the queue loops.
+        var count: u64 = 0
+        var readable: u64 = 0
+        var writable: u64 = 0
+        var ordered = true
+        var d = head
+        while (true) {
+            const x = self.desc_at(mem, d)
+            count = count + 1
+            // A buffer that would run past the top of the address space:
+            // every offset added to an address below stays within its
+            // buffer, so none of them can overflow.
+            if (x.len > U64_MAX - x.addr) {
+                return 0
+            }
+            if (x.flags & DESC_F_WRITE != 0) {
+                writable = writable + x.len
+            } else {
+                readable = readable + x.len
+                ordered = ordered and writable == 0
+            }
+            if (x.flags & DESC_F_NEXT == 0) {
+                break
+            }
+            if (x.next >= self.num or count == self.num) {
+                return 0
+            }
+            d = x.next
+        }
+        // Without a writable byte there is nowhere to say how it went.
+        if (writable == 0) {
+            return 0
+        }
+        // Where the status goes, checked before any disk I/O: a request
+        // done but never reported would be done again.
+        const status_addr = self.stream_addr(mem, head, count, true, writable - 1)
+        if (mem.offset(status_addr, 1) < 0) {
+            return 0
+        }
+        var result = Outcome.status_only(BLK_S_IOERR)
+        if (ordered and readable >= REQ_HEADER) {
+            result = self.handle(mem, head, count, readable, writable - 1)
+        }
+        mem.write_le(status_addr, 1, result.status) catch {
+            return 0
+        }
+        return result.written + 1
+    }
+
+    // The guest address of byte pos of one of the chain's streams.
+    fn stream_addr(self: Blk, mem: kvm.GuestMemory, head: u64, count: u64, writable: bool, pos: u64) u64 {
+        var start: u64 = 0
+        var d = head
+        var k: u64 = 0
+        while (k < count) {
+            const x = self.desc_at(mem, d)
+            if ((x.flags & DESC_F_WRITE != 0) == writable) {
+                if (pos < start + x.len) {
+                    return x.addr + (pos - start)
+                }
+                start = start + x.len
+            }
+            d = x.next
+            k = k + 1
+        }
+        return 0
+    }
+
+    // n bytes (up to 8), little-endian, from pos in the readable stream.
+    fn stream_le(self: Blk, mem: kvm.GuestMemory, head: u64, count: u64, pos: u64, n: u64) !u64 {
+        var v: u64 = 0
+        var i: u64 = 0
+        while (i < n) {
+            const b = try mem.read_le(self.stream_addr(mem, head, count, false, pos + i), 1)
+            v = v | (b << (i * 8))
+            i = i + 1
+        }
+        return v
+    }
+
+    // The request: its header from the readable stream; the data after
+    // the header there (a write), or the writable stream before the status
+    // byte (a read, the id).
+    fn handle(self: Blk, mem: kvm.GuestMemory, head: u64, count: u64, readable: u64, data_out: u64) Outcome {
+        const kind = self.stream_le(mem, head, count, 0, 4) catch {
+            return Outcome.status_only(BLK_S_IOERR)
+        }
+        const sector = self.stream_le(mem, head, count, 8, 8) catch {
+            return Outcome.status_only(BLK_S_IOERR)
+        }
+        if (kind == T_FLUSH) {
+            self.disk.sync() catch {
+                return Outcome.status_only(BLK_S_IOERR)
+            }
+            return Outcome.status_only(BLK_S_OK)
+        }
+        if (kind != T_IN and kind != T_OUT and kind != T_GET_ID) {
+            return Outcome.status_only(BLK_S_UNSUPP)
+        }
+        if (kind != T_GET_ID and sector > self.disk.size / SECTOR_SIZE) {
+            return Outcome.status_only(BLK_S_IOERR)
+        }
+        // The data: readable bytes [lo, hi) for a write, writable ones for
+        // the rest; each descriptor's share of that range in turn.
+        var lo: u64 = 0
+        var hi = data_out
+        const to_guest = kind != T_OUT
+        if (!to_guest) {
+            lo = REQ_HEADER
+            hi = readable
+        } else if (kind == T_GET_ID and hi > 20) {
+            hi = 20
+        }
+        // The disk offset, for a read or a write: GET_ID has none, and
+        // its sector is not checked.
+        var pos: u64 = 0
+        if (kind != T_GET_ID) {
+            pos = sector * SECTOR_SIZE
+        }
+        var written: u64 = 0
+        var start: u64 = 0
+        var d = head
+        var k: u64 = 0
+        while (k < count) {
+            const x = self.desc_at(mem, d)
+            if ((x.flags & DESC_F_WRITE != 0) == to_guest) {
+                var a = start
+                if (a < lo) {
+                    a = lo
+                }
+                var b = start + x.len
+                if (b > hi) {
+                    b = hi
+                }
+                if (a < b) {
+                    const addr = x.addr + (a - start)
+                    const n = b - a
+                    if (kind == T_GET_ID) {
+                        // The id, NUL-padded to 20 bytes, from byte a.
+                        var j: u64 = 0
+                        while (j < n) {
+                            var c: u64 = 0
+                            if (a + j < @as(u64, @len(ID))) {
+                                c = @as(u64, ID[@as(i64, a + j)])
+                            }
+                            mem.write_le(addr + j, 1, c) catch {
+                                return Outcome{ .status = BLK_S_IOERR, .written = written }
+                            }
+                            j = j + 1
+                        }
+                        written = written + n
+                    } else if (kind == T_IN) {
+                        self.disk.read_into(mem, addr, @as(i64, n), pos) catch {
+                            return Outcome{ .status = BLK_S_IOERR, .written = written }
+                        }
+                        written = written + n
+                        pos = pos + n
+                    } else {
+                        self.disk.write_from(mem, addr, @as(i64, n), pos) catch {
+                            return Outcome{ .status = BLK_S_IOERR, .written = written }
+                        }
+                        pos = pos + n
+                    }
+                }
+                start = start + x.len
+            }
+            d = x.next
+            k = k + 1
+        }
+        // A driver that did not take FLUSH has every write on the disk
+        // before it completes (virtio 1.2, 5.2.6.2).
+        if (kind == T_OUT and self.driver_features & F_BLK_FLUSH == 0) {
+            self.disk.sync() catch {
+                return Outcome{ .status = BLK_S_IOERR, .written = written }
+            }
+        }
+        return Outcome{ .status = BLK_S_OK, .written = written }
+    }
+}
+
+// struct virtq_desc, read from the guest's table.
+const Desc = struct {
+    addr: u64
+    len: u64
+    flags: u64
+    next: u64
+}
+
+// A request's status byte, and the bytes its data took.
+const Outcome = struct {
+    status: u64
+    written: u64
+
+    fn status_only(s: u64) Outcome {
+        return Outcome{ .status = s, .written = 0 }
+    }
+}

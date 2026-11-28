@@ -1,0 +1,55 @@
+magic 1953655158, version 2, device 2
+capacity 128 sectors; as two halves 128 0; one byte 128
+disk closes on exec true
+owns 0xc0000fff true, 0xc0001000 false; no device false
+without VERSION_1: status 3
+queue of 6: ready 0
+used ring past the end of memory: ready 0
+features 1:512, status after FEATURES_OK 11
+queue max 256, ready 0
+ready 1, status 15
+get id: used 1 id 0 len 21, status 0, line true isr 1, after ack false
+id 7310021032745068389 32199659248251491
+write sector 1: used 2 id 0 len 1, status 0, line true isr 1, after ack false
+read sectors 0-2: used 3 id 0 len 1537, status 0, line true isr 1, after ack false
+sector 0: first 0, last 0, 512 of 512 like the first
+sector 1: first 171, last 171, 512 of 512 like the first
+sector 2: first 0, last 0, 512 of 512 like the first
+flush: used 4 id 0 len 1, status 0, line true isr 1, after ack false
+type 99: used 5 id 0 len 1, status 2, line true isr 1, after ack false
+read past the end: used 6 id 0 len 1, status 1, line true isr 1, after ack false
+read at sector 2^64-1: used 7 id 0 len 1, status 1, line true isr 1, after ack false
+read into a readable buffer: used 8 id 0 len 1, status 0, line true isr 1, after ack false
+write from a writable buffer: used 9 id 0 len 1, status 0, line true isr 1, after ack false
+read past guest memory: used 10 id 0 len 1, status 1, line true isr 1, after ack false
+header in two: used 11 id 0 len 1, status 0, line true isr 1, after ack false
+header and data in one: used 12 id 0 len 1, status 0, line true isr 1, after ack false
+(status in the data's descriptor, at byte 512)
+sector 3: first 205, last 205, 512 of 512 like the first
+status byte 0, len 513
+get id in two: used 14 id 0 len 21, status 0, line true isr 1, after ack false
+id 7310021032745068389 29283 | 491327808353 0
+readable after writable: used 15 id 0 len 1, status 1, line true isr 1, after ack false
+status outside memory: len 0
+read sector 5: used 17 id 0 len 513, status 0, line true isr 1, after ack false
+sector 5: first 0, last 0, 512 of 512 like the first
+get id at sector 2^64-1: used 18 id 0 len 21, status 0, line true isr 1, after ack false
+buffer at 2^64-1: used 19 id 0 len 0, status 255, line true isr 1, after ack false
+buffer ending at 2^64: used 20 id 0 len 0, status 255, line true isr 1, after ack false
+loop: used 21 id 0 len 0, status 255, line true isr 1, after ack false
+next out of the queue: used 22 id 0 len 0, status 255, line true isr 1, after ack false
+header alone: used 23 id 0 len 0, status 255, line true isr 1, after ack false
+readable status: used 24 id 0 len 0, status 255, line true isr 1, after ack false
+head 8: used 25 id 8 len 0, status 255, line true isr 1, after ack false
+flush after: used 26 id 0 len 1, status 0, line true isr 1, after ack false
+write at avail 65534: used 65535 id 0 len 1, status 0, line true isr 1, after ack false
+read at avail 65535: used 0 id 0 len 513, status 0, line true isr 1, after ack false
+read at avail 0: used 1 id 0 len 513, status 0, line true isr 1, after ack false
+sector 7: first 90, last 90, 512 of 512 like the first
+avail index 9 ahead: used 1, line false
+completed, not acknowledged: line true, isr 1
+after reset: status 0, ready 0, line false
+features 1:512, status after FEATURES_OK 11
+queue max 256, ready 0
+ready 1, status 15
+write without FLUSH: used 1 id 0 len 1, status 0, line true isr 1, after ack false

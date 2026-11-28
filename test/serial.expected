@@ -21,4 +21,7 @@ RDA enabled behind OUT2: irq false
 OUT2 opened, FIFO empty: irq true
 takes input: rbr true, iir true, lsr true, ier false
 with DLAB: rbr false
+rx irq: IER 0 false
+rx irq: RDA, OUT2 low false
+rx irq: RDA, OUT2 high true
 FIFO took 64, room 0

@@ -5,6 +5,10 @@
 #     ./run-omarchy.sh                 # default kernel command line
 #     ./run-omarchy.sh "console=ttyS0 reboot=k panic=1 pci=off loglevel=8"
 #     ./run-omarchy.sh --initramfs     # into a busybox shell (tools/mkinitramfs.sh); ^A x stops
+#     ./run-omarchy.sh --ubuntu        # Ubuntu from ~/fc/ubuntu-24.04.ext4 on virtio-blk
+#
+# --ubuntu boots a copy of the image, ~/fc/ubuntu-24.04.egg.ext4, made once
+# (sparse) and kept, so the guest's writes never reach the original.
 #
 # Overrides: OMARCHY_HOST (default femto@192.168.109.129), EGG_DIR (the Egg
 # compiler checkout, default ../egg), KERNEL (path on Omarchy).
@@ -15,8 +19,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 EGG_DIR="${EGG_DIR:-$HERE/../egg}"
 KERNEL="${KERNEL:-fc/vmlinux-6.18.62}"   # relative to the home directory on Omarchy
 INITRAMFS=0
+UBUNTU=0
 if [ "${1:-}" = "--initramfs" ]; then
     INITRAMFS=1
+    shift
+elif [ "${1:-}" = "--ubuntu" ]; then
+    UBUNTU=1
     shift
 fi
 
@@ -49,6 +57,14 @@ if [ "$INITRAMFS" = 1 ]; then
     # A busybox on the PATH, else one unpacked from Arch's package into ~/fc/busybox.
     ssh -n "$HOST" 'cd ~/egg-firecracker && BUSYBOX="$(command -v busybox || echo ~/fc/busybox/usr/bin/busybox)" tools/mkinitramfs.sh build/initramfs.cpio'
     remote="$remote --initrd build/initramfs.cpio"
+fi
+if [ "$UBUNTU" = 1 ]; then
+    echo "==> preparing the root file system"
+    # Copied to a temporary name and renamed when whole, so an interrupted
+    # copy is never booted; under a lock of its own, so two runs started
+    # together copy once (the second finds the image when it gets the lock).
+    ssh -n "$HOST" 'cd ~/fc && flock ubuntu-24.04.egg.ext4.lock sh -c "test -f ubuntu-24.04.egg.ext4 || { cp --sparse=always ubuntu-24.04.ext4 ubuntu-24.04.egg.ext4.part && mv ubuntu-24.04.egg.ext4.part ubuntu-24.04.egg.ext4; }"'
+    remote="$remote --drive ~/fc/ubuntu-24.04.egg.ext4"
 fi
 
 echo "==> booting ~/$KERNEL"

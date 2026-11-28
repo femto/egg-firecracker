@@ -1,0 +1,83 @@
+// The ACPI tables, followed from the RSDP as the kernel follows them, on
+// 1 MiB of guest memory in a buffer: each signature, length and checksum,
+// and the DSDT's AML as hex (for iasl -d). Needs no KVM.
+uses io, alloc
+allow unsafe
+const kvm = @import("firecracker/kvm")
+const acpi = @import("firecracker/acpi")
+
+const MEM = 0x100000
+
+// The low byte of the sum of len bytes at addr: 0 for a good table.
+fn sum(mem: kvm.GuestMemory, addr: u64, len: u64) !u64 {
+    var s: u64 = 0
+    var i: u64 = 0
+    while (i < len) {
+        s = s + try mem.read_le(addr + i, 1)
+        i = i + 1
+    }
+    return s & 0xff
+}
+
+fn signature(a: Allocator, mem: kvm.GuestMemory, addr: u64, n: u64) !Buf(u8) {
+    var s = Buf(u8).empty
+    errdefer a.free(s)
+    var i: u64 = 0
+    while (i < n) {
+        a.push(&s, @as(u8, try mem.read_le(addr + i, 1)))
+        i = i + 1
+    }
+    return s
+}
+
+// A table's header: signature, length, revision, checksum.
+fn table(io: Io, a: Allocator, mem: kvm.GuestMemory, addr: u64) !u64 {
+    const sig = try signature(a, mem, addr, 4)
+    defer a.free(sig)
+    const len = try mem.read_le(addr + 4, 4)
+    io.print(sig, " at ", addr, ": ", len, " bytes, revision ", try mem.read_le(addr + 8, 1), ", sum ", try sum(mem, addr, len))
+    return len
+}
+
+fn dump(io: Io, a: Allocator, mem: kvm.GuestMemory, what: str, with_blk: bool) !void {
+    const rsdp = try acpi.write_tables(mem, a, with_blk)
+    const sig = try signature(a, mem, rsdp, 8)
+    defer a.free(sig)
+    io.print(what, ": ", sig, " at ", rsdp, ", revision ", try mem.read_le(rsdp + 15, 1), ", sum of 20 ", try sum(mem, rsdp, 20), ", of 36 ", try sum(mem, rsdp, 36))
+    const xsdt = try mem.read_le(rsdp + 24, 8)
+    const xlen = try table(io, a, mem, xsdt)
+    var p = xsdt + 36
+    var dsdt: u64 = 0
+    while (p < xsdt + xlen) {
+        const t = try mem.read_le(p, 8)
+        _ = try table(io, a, mem, t)
+        const tsig = try mem.read_le(t, 4)
+        if (tsig == 0x50434146) {       // "FACP"
+            dsdt = try mem.read_le(t + 140, 8)
+            io.print("  FADT flags ", try mem.read_le(t + 112, 4), ", iapc_boot_arch ", try mem.read_le(t + 109, 2))
+        } else if (tsig == 0x43495041) {   // "APIC"
+            io.print("  MADT local APIC ", try mem.read_le(t + 36, 4), ", IOAPIC ", try mem.read_le(t + 48, 4), ", CPU flags ", try mem.read_le(t + 60, 4))
+        }
+        p = p + 8
+    }
+    const dlen = try table(io, a, mem, dsdt)
+    var hex = Buf(u8).empty
+    defer a.free(hex)
+    const digits = "0123456789abcdef"
+    var i: u64 = 0
+    while (i < dlen) {
+        const b = try mem.read_le(dsdt + i, 1)
+        a.push(&hex, digits[@as(i64, b >> 4)])
+        a.push(&hex, digits[@as(i64, b & 0xf)])
+        i = i + 1
+    }
+    io.print("  DSDT ", hex)
+}
+
+fn main(io: Io, a: Allocator) !void {
+    const buf = a.alloc(MEM, @as(u8, 0))
+    defer a.free(buf)
+    const mem = kvm.GuestMemory{ .base = @bufPtr(buf), .gpa = 0, .size = MEM }
+    try dump(io, a, mem, "no drive", false)
+    try dump(io, a, mem, "with a drive", true)
+}
