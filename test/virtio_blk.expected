@@ -1,5 +1,6 @@
 magic 1953655158, version 2, device 2
 capacity 128 sectors; as two halves 128 0; one byte 128
+disk closes on exec true
 owns 0xc0000fff true, 0xc0001000 false; no device false
 without VERSION_1: status 3
 queue of 6: ready 0

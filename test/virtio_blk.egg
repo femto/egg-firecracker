@@ -136,6 +136,7 @@ fn main(io: Io, a: Allocator) !void {
 
     io.print("magic ", reg(b, 0x000), ", version ", reg(b, 0x004), ", device ", reg(b, 0x008))
     io.print("capacity ", b.read(virtio.MMIO_BASE + 0x100, 8), " sectors; as two halves ", reg(b, 0x100), " ", reg(b, 0x104), "; one byte ", b.read(virtio.MMIO_BASE + 0x100, 1))
+    io.print("disk closes on exec ", b.disk.close_on_exec())
     io.print("owns 0xc0000fff ", b.owns(0xc0000fff), ", 0xc0001000 ", b.owns(0xc0001000), "; no device ", virtio.Blk.none().owns(0xc0000000))
 
     // A driver without VERSION_1 is refused.

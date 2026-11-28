@@ -37,6 +37,8 @@ extern fn flock(fd: i32, op: i32) i32 uses fs
 // system's open flags to use, as the tests run on macOS too.
 extern fn getpid() i32 uses fs
 extern fn uname(buf: *u8) i32 uses fs
+// fcntl is variadic; F_GETFD takes no third argument, and 0 is passed.
+extern fn fcntl(fd: i32, cmd: i32, arg: i32) i32 uses fs
 extern fn unlink(path: *u8) i32 uses fs
 extern fn ftruncate(fd: i32, len: i64) i32 uses fs
 
@@ -45,6 +47,9 @@ const O_CREAT_LINUX: i32 = 0x40
 const O_EXCL_LINUX: i32 = 0x80
 const O_CREAT_BSD: i32 = 0x200
 const O_EXCL_BSD: i32 = 0x800
+const O_CLOEXEC_BSD: i32 = 0x1000000
+const F_GETFD: i32 = 1
+const FD_CLOEXEC: i32 = 1
 const LOCK_EX: i32 = 2
 const LOCK_NB: i32 = 4
 const O_CLOEXEC: i32 = 0x80000
@@ -289,15 +294,21 @@ const Disk = struct {
         a.free(name)
         // One exclusive create: an existing file or symlink at the path
         // makes it fail, rather than be opened or truncated.
-        var create = O_CREAT_LINUX | O_EXCL_LINUX
+        var create = O_CREAT_LINUX | O_EXCL_LINUX | O_CLOEXEC
         if (!on_linux(a)) {
-            create = O_CREAT_BSD | O_EXCL_BSD
+            create = O_CREAT_BSD | O_EXCL_BSD | O_CLOEXEC_BSD
         }
-        const fd = try sys(open(path, O_RDWR | O_CLOEXEC | create, 0x180))   // 0600
+        const fd = try sys(open(path, O_RDWR | create, 0x180))   // 0600
         _ = unlink(path)
         errdefer close_fd(fd)
         _ = try sys(ftruncate(fd, size))
         return Disk{ .fd = fd, .size = @as(u64, size) }
+    }
+
+    // Whether the descriptor closes on exec: F_GETFD and FD_CLOEXEC are
+    // the same on Linux and macOS.
+    fn close_on_exec(self: Disk) bool {
+        return fcntl(self.fd, F_GETFD, 0) & FD_CLOEXEC != 0
     }
 
     fn close(self: Disk) void {
