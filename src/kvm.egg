@@ -8,7 +8,9 @@
 uses fs, alloc, io
 allow unsafe
 
-extern fn open(path: *u8, flags: i32) i32 uses fs
+// open is variadic in C; its mode, used only with O_CREAT, is passed as a
+// third integer argument, as x86_64 passes it.
+extern fn open(path: *u8, flags: i32, mode: u32) i32 uses fs
 extern fn close(fd: i32) i32 uses fs
 // ioctl is variadic in C; every KVM request here passes one integer or
 // pointer argument, which the x86_64 calling convention passes the same way.
@@ -31,13 +33,18 @@ extern fn pwrite(fd: i32, buf: *u8, n: usize, off: i64) i64 uses fs
 extern fn fsync(fd: i32) i32 uses fs
 extern fn flock(fd: i32, op: i32) i32 uses fs
 // For a temporary disk: mkstemp is in <stdlib.h>, which Egg's C includes,
-// with a char * that a *u8 here would clash with.
-extern fn creat(path: *u8, mode: u32) i32 uses fs
+// with a char * that a *u8 here would clash with. uname tells which
+// system's open flags to use, as the tests run on macOS too.
 extern fn getpid() i32 uses fs
+extern fn uname(buf: *u8) i32 uses fs
 extern fn unlink(path: *u8) i32 uses fs
 extern fn ftruncate(fd: i32, len: i64) i32 uses fs
 
 const O_RDWR: i32 = 2
+const O_CREAT_LINUX: i32 = 0x40
+const O_EXCL_LINUX: i32 = 0x80
+const O_CREAT_BSD: i32 = 0x200
+const O_EXCL_BSD: i32 = 0x800
 const LOCK_EX: i32 = 2
 const LOCK_NB: i32 = 4
 const O_CLOEXEC: i32 = 0x80000
@@ -242,6 +249,17 @@ fn exit_now(code: i32) void {
     _exit(code)
 }
 
+// Whether this is Linux: struct utsname starts with sysname, NUL-ended,
+// on Linux and macOS alike.
+fn on_linux(a: Allocator) bool {
+    const u = a.alloc(2048, @as(u8, 0))
+    defer a.free(u)
+    if (uname(@bufPtr(u)) < 0) {
+        return true
+    }
+    return u[0] == 'L' and u[1] == 'i' and u[2] == 'n' and u[3] == 'u' and u[4] == 'x' and u[5] == 0
+}
+
 // A disk image open for reading and writing, of size bytes.
 const Disk = struct {
     fd: i32
@@ -250,7 +268,7 @@ const Disk = struct {
     // Locked for this process alone: two guests writing one file system
     // image would corrupt it.
     fn open_path(a: Allocator, path: str) !Disk {
-        const fd = try sys(open(a.cstr(path), O_RDWR | O_CLOEXEC))
+        const fd = try sys(open(a.cstr(path), O_RDWR | O_CLOEXEC, 0))
         errdefer close_fd(fd)
         if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
             return error.DiskInUse
@@ -269,8 +287,13 @@ const Disk = struct {
         a.append_int(&name, getpid())
         const path = a.cstr(a.leak(name))
         a.free(name)
-        close_fd(try sys(creat(path, 0x180)))   // 0600
-        const fd = try sys(open(path, O_RDWR | O_CLOEXEC))
+        // One exclusive create: an existing file or symlink at the path
+        // makes it fail, rather than be opened or truncated.
+        var create = O_CREAT_LINUX | O_EXCL_LINUX
+        if (!on_linux(a)) {
+            create = O_CREAT_BSD | O_EXCL_BSD
+        }
+        const fd = try sys(open(path, O_RDWR | O_CLOEXEC | create, 0x180))   // 0600
         _ = unlink(path)
         errdefer close_fd(fd)
         _ = try sys(ftruncate(fd, size))
@@ -328,7 +351,7 @@ const Disk = struct {
 // capability: using that makes the generated C include <fcntl.h>, whose
 // open (variadic, const char *) clashes with the extern fn above.
 fn read_file(a: Allocator, path: str) !Buf(u8) {
-    const fd = try sys(open(a.cstr(path), O_CLOEXEC))   // O_RDONLY
+    const fd = try sys(open(a.cstr(path), O_CLOEXEC, 0))   // O_RDONLY
     defer close_fd(fd)
     const size = lseek(fd, 0, SEEK_END_)
     if (size <= 0) {
@@ -349,7 +372,7 @@ const Kvm = struct {
     fd: i32
 
     fn init(a: Allocator) !Kvm {
-        const fd = try sys(open(a.cstr("/dev/kvm"), O_RDWR | O_CLOEXEC))
+        const fd = try sys(open(a.cstr("/dev/kvm"), O_RDWR | O_CLOEXEC, 0))
         const kvm = Kvm{ .fd = fd }
         if (try sys(ioctl(fd, KVM_GET_API_VERSION, 0)) != KVM_API_VERSION) {
             return error.KvmApiVersion

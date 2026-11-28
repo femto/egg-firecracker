@@ -100,6 +100,7 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
         io.eprint("[vmm] drive ", drive, ": ", blk.disk.size, " bytes, /dev/vda")
     }
     defer blk.disk.close()
+    var blk_line = false
 
     const vcpu = try vm.create_vcpu(0)
     const cpuid = try k.supported_cpuid(a)
@@ -170,8 +171,16 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
                 } else {
                     try vcpu.complete_read(exit, blk.read(exit.addr, exit.size))
                 }
-                if (blk.take_irq()) {
-                    try vm.irq_pulse(a, virtio.IRQ)
+                // The device's line is level-triggered: it follows the
+                // interrupt status, raised by a completion, lowered by
+                // the driver's acknowledgement or a reset.
+                if (blk.line() != blk_line) {
+                    blk_line = blk.line()
+                    var level: u64 = 0
+                    if (blk_line) {
+                        level = 1
+                    }
+                    try vm.irq_line(a, virtio.IRQ, level)
                 }
             } else if (!exit.write) {
                 try vcpu.complete_read(exit, 0)

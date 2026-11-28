@@ -54,10 +54,20 @@ fn submit(io: Io, inout b: virtio.Blk, mem: kvm.GuestMemory, what: str, head: u6
     const slot = USED + 4 + 8 * ((used_idx + 0xffff) % N)
     const id = try mem.read_le(slot, 4)
     const len = try mem.read_le(slot + 4, 4)
-    const irq = b.take_irq()
+    const line = b.line()
     const isr = reg(b, 0x060)
     set(&b, mem, 0x064, isr)
-    io.print(what, ": used ", used_idx, " id ", id, " len ", len, ", status ", try mem.read_le(STATUS, 1), ", irq ", irq, " isr ", isr)
+    io.print(what, ": used ", used_idx, " id ", id, " len ", len, ", status ", try mem.read_le(STATUS, 1), ", line ", line, " isr ", isr, ", after ack ", b.line())
+}
+
+// Makes the chain at head available and notifies, quietly.
+fn quiet(inout b: virtio.Blk, mem: kvm.GuestMemory, head: u64) !void {
+    const idx = try mem.read_le(AVAIL + 2, 2)
+    try mem.write_le(AVAIL + 4 + 2 * (idx % N), 2, head)
+    try mem.write_le(AVAIL + 2, 2, (idx + 1) & 0xffff)
+    set(&b, mem, 0x050, 0)
+    const isr = reg(b, 0x060)
+    set(&b, mem, 0x064, isr)
 }
 
 fn fill(mem: kvm.GuestMemory, addr: u64, len: u64, v: u64) !void {
@@ -85,7 +95,7 @@ fn show(io: Io, mem: kvm.GuestMemory, what: str, addr: u64, len: u64) !void {
 
 // The driver's side of starting the device, as virtio_mmio and
 // virtio_blk do it.
-fn start(io: Io, inout b: virtio.Blk, mem: kvm.GuestMemory) void {
+fn start(io: Io, inout b: virtio.Blk, mem: kvm.GuestMemory, take_flush: bool) void {
     set(&b, mem, 0x070, 0)
     set(&b, mem, 0x070, 1)          // ACKNOWLEDGE
     set(&b, mem, 0x070, 3)          // DRIVER
@@ -93,8 +103,12 @@ fn start(io: Io, inout b: virtio.Blk, mem: kvm.GuestMemory) void {
     const lo = reg(b, 0x010)
     set(&b, mem, 0x014, 1)
     const hi = reg(b, 0x010)
+    var take = lo
+    if (!take_flush) {
+        take = lo & ~@as(u64, 0x200)
+    }
     set(&b, mem, 0x024, 0)
-    set(&b, mem, 0x020, lo)
+    set(&b, mem, 0x020, take)
     set(&b, mem, 0x024, 1)
     set(&b, mem, 0x020, hi)
     set(&b, mem, 0x070, 11)         // FEATURES_OK
@@ -136,8 +150,13 @@ fn main(io: Io, a: Allocator) !void {
     set(&b, mem, 0x038, 6)
     set(&b, mem, 0x044, 1)
     io.print("queue of 6: ready ", reg(b, 0x044))
+    // A used ring that does not fit in guest memory does not either.
+    set(&b, mem, 0x038, N)
+    set(&b, mem, 0x0a0, @as(u64, MEM) - 32)
+    set(&b, mem, 0x044, 1)
+    io.print("used ring past the end of memory: ready ", reg(b, 0x044))
 
-    start(io, &b, mem)
+    start(io, &b, mem, true)
 
     // GET_ID: header, a 20-byte buffer, the status.
     try header(mem, 8, 0)
@@ -189,6 +208,54 @@ fn main(io: Io, a: Allocator) !void {
     try desc(mem, 1, @as(u64, MEM) - 256, 512, F_NEXT | F_WRITE, 2)
     try submit(io, &b, mem, "read past guest memory", 0)
 
+    // Any layout of the two streams. The header cut in two (8 + 8) for a
+    // flush; a header and its data in one readable descriptor (sector 3,
+    // 0xcd); data and status in one writable one, read back.
+    try header(mem, 4, 0)
+    try desc(mem, 0, HDR, 8, F_NEXT, 5)
+    try desc(mem, 5, HDR + 8, 8, F_NEXT, 2)
+    try submit(io, &b, mem, "header in two", 0)
+    try header(mem, 1, 3)
+    try fill(mem, HDR + 16, 512, 0xcd)
+    try desc(mem, 0, HDR, 16 + 512, F_NEXT, 2)
+    try submit(io, &b, mem, "header and data in one", 0)
+    try header(mem, 0, 3)
+    try fill(mem, DATA2, 513, 0x11)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA2, 513, F_WRITE, 0)
+    io.print("(status in the data's descriptor, at byte 512)")
+    try mem.write_le(STATUS, 1, 0xff)
+    try quiet(&b, mem, 0)
+    try show(io, mem, "sector 3", DATA2, 512)
+    io.print("status byte ", try mem.read_le(DATA2 + 512, 1), ", len ", try mem.read_le(USED + 4 + 8 * (((try mem.read_le(USED + 2, 2)) + 0xffff) % N) + 4, 4))
+    // GET_ID into two 10-byte buffers: the 20 bytes, once.
+    try fill(mem, DATA, 32, 0x2e)
+    try header(mem, 8, 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA, 10, F_NEXT | F_WRITE, 3)
+    try desc(mem, 3, DATA + 16, 10, F_NEXT | F_WRITE, 2)
+    try desc(mem, 2, STATUS, 1, F_WRITE, 0)
+    try submit(io, &b, mem, "get id in two", 0)
+    io.print("id ", try mem.read_le(DATA, 8), " ", try mem.read_le(DATA + 8, 2), " | ", try mem.read_le(DATA + 16, 8), " ", try mem.read_le(DATA + 24, 2))
+    // A readable descriptor after a writable one.
+    try header(mem, 0, 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA2, 512, F_NEXT | F_WRITE, 3)
+    try desc(mem, 3, DATA, 16, F_NEXT, 2)
+    try submit(io, &b, mem, "readable after writable", 0)
+    // A status byte outside guest memory: not done, and not written.
+    try header(mem, 1, 5)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA, 512, F_NEXT, 2)
+    try desc(mem, 2, @as(u64, MEM), 1, F_WRITE, 0)
+    try quiet(&b, mem, 0)
+    io.print("status outside memory: len ", try mem.read_le(USED + 4 + 8 * (((try mem.read_le(USED + 2, 2)) + 0xffff) % N) + 4, 4))
+    try desc(mem, 2, STATUS, 1, F_WRITE, 0)
+    try header(mem, 0, 5)
+    try desc(mem, 1, DATA2, 512, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "read sector 5", 0)
+    try show(io, mem, "sector 5", DATA2, 512)
+
     // Broken chains: a loop, a next out of the queue, no status, a status
     // the device cannot write, a head out of the queue. Each is answered
     // and the device goes on.
@@ -207,13 +274,49 @@ fn main(io: Io, a: Allocator) !void {
     try header(mem, 4, 0)
     try submit(io, &b, mem, "flush after", 0)
 
+    // Past 2^16 requests, both indexes wrap: GET_IDs to just short of it,
+    // then a write and a read across.
+    try header(mem, 8, 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA, 20, F_NEXT | F_WRITE, 2)
+    while (try mem.read_le(AVAIL + 2, 2) < 65534) {
+        try quiet(&b, mem, 0)
+    }
+    try fill(mem, DATA, 512, 0x5a)
+    try header(mem, 1, 7)
+    try desc(mem, 1, DATA, 512, F_NEXT, 2)
+    try submit(io, &b, mem, "write at avail 65534", 0)
+    try fill(mem, DATA2, 512, 0x11)
+    try header(mem, 0, 7)
+    try desc(mem, 1, DATA2, 512, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "read at avail 65535", 0)
+    try submit(io, &b, mem, "read at avail 0", 0)
+    try show(io, mem, "sector 7", DATA2, 512)
+
     // An avail index more than a queue ahead serves nothing.
     const idx = try mem.read_le(AVAIL + 2, 2)
     try mem.write_le(AVAIL + 2, 2, (idx + N + 1) & 0xffff)
     set(&b, mem, 0x050, 0)
-    io.print("avail index 9 ahead: used ", try mem.read_le(USED + 2, 2), ", irq ", b.take_irq())
+    io.print("avail index 9 ahead: used ", try mem.read_le(USED + 2, 2), ", line ", b.line())
 
-    // Reset, then started again from nothing.
+    // An unacknowledged completion keeps the line up; a reset drops it.
+    try mem.write_le(AVAIL + 2, 2, idx)
+    try header(mem, 4, 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 2)
+    try mem.write_le(AVAIL + 4 + 2 * (idx % N), 2, 0)
+    try mem.write_le(AVAIL + 2, 2, (idx + 1) & 0xffff)
+    set(&b, mem, 0x050, 0)
+    io.print("completed, not acknowledged: line ", b.line(), ", isr ", reg(b, 0x060))
     set(&b, mem, 0x070, 0)
-    io.print("after reset: status ", reg(b, 0x070), ", ready ", reg(b, 0x044))
+    io.print("after reset: status ", reg(b, 0x070), ", ready ", reg(b, 0x044), ", line ", b.line())
+
+    // A driver that does not take FLUSH: its writes are synced before they
+    // complete, and still complete.
+    try mem.write_le(AVAIL + 2, 2, 0)
+    try mem.write_le(USED + 2, 2, 0)
+    start(io, &b, mem, false)
+    try header(mem, 1, 9)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA, 512, F_NEXT, 2)
+    try submit(io, &b, mem, "write without FLUSH", 0)
 }

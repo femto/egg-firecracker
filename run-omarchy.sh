@@ -60,7 +60,9 @@ if [ "$INITRAMFS" = 1 ]; then
 fi
 if [ "$UBUNTU" = 1 ]; then
     echo "==> preparing the root file system"
-    ssh -n "$HOST" 'test -f ~/fc/ubuntu-24.04.egg.ext4 || cp --sparse=always ~/fc/ubuntu-24.04.ext4 ~/fc/ubuntu-24.04.egg.ext4'
+    # Copied to a temporary name and renamed when whole, so an interrupted
+    # copy is never booted.
+    ssh -n "$HOST" 'test -f ~/fc/ubuntu-24.04.egg.ext4 || { cp --sparse=always ~/fc/ubuntu-24.04.ext4 ~/fc/ubuntu-24.04.egg.ext4.part && mv ~/fc/ubuntu-24.04.egg.ext4.part ~/fc/ubuntu-24.04.egg.ext4; }'
     remote="$remote --drive ~/fc/ubuntu-24.04.egg.ext4"
 fi
 

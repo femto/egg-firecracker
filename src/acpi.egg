@@ -137,7 +137,7 @@ fn dsdt_body(a: Allocator, inout out: Buf(u8), with_blk: bool) void {
     name_str(a, &com1, "_DDN", "COM1")
     var com1_res = Buf(u8).empty
     defer a.free(com1_res)
-    interrupt(a, &com1_res, COM1_IRQ)
+    interrupt(a, &com1_res, COM1_IRQ, true)
     io(a, &com1_res, COM1_PORT, 8)
     name_crs(a, &com1, com1_res)
     device(a, &out, com1)
@@ -161,12 +161,13 @@ fn dsdt_body(a: Allocator, inout out: Buf(u8), with_blk: bool) void {
     defer a.free(ps2_res)
     io(a, &ps2_res, I8042_DATA_PORT, 1)
     io(a, &ps2_res, I8042_COMMAND_PORT, 1)
-    interrupt(a, &ps2_res, KBD_IRQ)
+    interrupt(a, &ps2_res, KBD_IRQ, true)
     name_crs(a, &ps2, ps2_res)
     device(a, &out, ps2)
 
     if (with_blk) {
-        // Device (V000): virtio-mmio, its registers and its IRQ.
+        // Device (V000): virtio-mmio, its registers and its IRQ, level-
+        // triggered.
         var v = Buf(u8).empty
         defer a.free(v)
         a.append_str(&v, "V000")
@@ -180,7 +181,7 @@ fn dsdt_body(a: Allocator, inout out: Buf(u8), with_blk: bool) void {
         put(a, &res, 1, 1)
         put(a, &res, virtio.MMIO_BASE, 4)
         put(a, &res, virtio.MMIO_SIZE, 4)
-        interrupt(a, &res, virtio.IRQ)
+        interrupt(a, &res, virtio.IRQ, false)
         name_crs(a, &v, res)
         device(a, &out, v)
     }
@@ -338,11 +339,17 @@ fn name_crs(a: Allocator, inout b: Buf(u8), descriptors: Buf(u8)) void {
     a.append_str(&b, data)
 }
 
-// Extended Interrupt: consumer, edge-triggered, active high, exclusive.
-fn interrupt(a: Allocator, inout b: Buf(u8), irq: u64) void {
+// Extended Interrupt: consumer, active high, exclusive; edge-triggered
+// (the ISA devices) or level (the virtio device, whose line follows its
+// interrupt status).
+fn interrupt(a: Allocator, inout b: Buf(u8), irq: u64, edge: bool) void {
+    var flags: u64 = 0x01
+    if (edge) {
+        flags = 0x03
+    }
     put(a, &b, 0x89, 1)
     put(a, &b, 6, 2)
-    put(a, &b, 0x03, 1)
+    put(a, &b, flags, 1)
     put(a, &b, 1, 1)
     put(a, &b, irq, 4)
 }
