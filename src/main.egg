@@ -6,7 +6,8 @@
 // exits for the serial port and the i8042 reset that `reboot=k` uses.
 // Standard input goes to the serial port; on a terminal, raw, with ^A x to
 // stop.
-uses io, args, fs, alloc, time, thread
+uses io, args, fs, alloc, thread
+const time = @import("std/time")
 const kvm = @import("kvm.egg")
 const boot = @import("boot.egg")
 const serial = @import("serial.egg")
@@ -20,7 +21,7 @@ const I8042_COMMAND = 0x64
 const I8042_RESET: u64 = 0xfe
 const CMOS_DATA = 0x71
 
-fn main(io: Io, args: Args, files: Fs, a: Allocator, clock: Clock, threads: Threads) void {
+fn main(io: Io, args: Args, files: Fs, a: Allocator, threads: Threads) void {
     if (args.len() < 2) {
         io.eprint("usage: firecracker VMLINUX [--initrd FILE] [CMDLINE]")
         return
@@ -41,13 +42,13 @@ fn main(io: Io, args: Args, files: Fs, a: Allocator, clock: Clock, threads: Thre
             i = i + 1
         }
     }
-    run(io, files, a, clock, threads, args.get(1), initrd, cmdline) catch |e| {
+    run(io, files, a, threads, args.get(1), initrd, cmdline) catch |e| {
         io.eprint("firecracker: ", @errorName(e))
     }
 }
 
-fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: str, initrd: str, cmdline: str) !void {
-    const start = clock.monotonic()
+fn run(io: Io, files: Fs, a: Allocator, threads: Threads, kernel: str, initrd: str, cmdline: str) !void {
+    const start = time.monotonic()
     const k = try kvm.Kvm.init(a)
     const vm = try k.create_vm()
     try vm.create_irqchip(a)
@@ -111,7 +112,7 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
                     try vm.irq_pulse(a, serial.IRQ)
                 }
             } else if (exit.port == I8042_COMMAND and exit.data == I8042_RESET) {
-                done(io, a, &line, clock, start, exits, "the guest reset the machine (i8042)")
+                done(io, a, &line, start, exits, "the guest reset the machine (i8042)")
                 return
             }
         } else if (exit.reason == kvm.EXIT_IO) {
@@ -134,24 +135,24 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
                 try vcpu.complete_read(exit, 0)
             }
         } else if (exit.reason == kvm.EXIT_SYSTEM_EVENT) {
-            done(io, a, &line, clock, start, exits, "the guest shut down or reset (system event)")
+            done(io, a, &line, start, exits, "the guest shut down or reset (system event)")
             return
         } else if (exit.reason == kvm.EXIT_SHUTDOWN) {
-            done(io, a, &line, clock, start, exits, "triple fault")
+            done(io, a, &line, start, exits, "triple fault")
             return error.TripleFault
         } else if (exit.reason == kvm.EXIT_HLT) {
-            done(io, a, &line, clock, start, exits, "the vCPU halted")
+            done(io, a, &line, start, exits, "the vCPU halted")
             return
         } else {
-            done(io, a, &line, clock, start, exits, "unexpected exit")
+            done(io, a, &line, start, exits, "unexpected exit")
             io.eprint("[vmm] exit reason ", exit.reason, ", detail ", exit.detail)
             return error.UnexpectedExit
         }
     }
 }
 
-fn done(io: Io, a: Allocator, inout line: Buf(u8), clock: Clock, start: i64, exits: i64, why: str) void {
+fn done(io: Io, a: Allocator, inout line: Buf(u8), start: i64, exits: i64, why: str) void {
     console.flush(io, a, &line)
-    const ms = (clock.monotonic() - start) / 1000000
+    const ms = (time.monotonic() - start) / 1000000
     io.eprint("[vmm] ", why, " after ", ms, " ms and ", exits, " VM exits")
 }
