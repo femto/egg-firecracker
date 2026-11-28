@@ -1,0 +1,219 @@
+// The virtio block device, driven as Linux's virtio-mmio and virtio-blk
+// drivers drive it, on 1 MiB of guest memory in a buffer and a 64 KiB
+// disk in a temporary file. Needs no KVM.
+uses io, alloc, fs
+allow unsafe
+const kvm = @import("firecracker/kvm")
+const virtio = @import("firecracker/virtio")
+
+const MEM = 0x100000
+const DISK = 65536
+const N: u64 = 8
+
+// Where the driver puts things in guest memory.
+const DESC: u64 = 0x1000
+const AVAIL: u64 = 0x2000
+const USED: u64 = 0x3000
+const HDR: u64 = 0x8000
+const STATUS: u64 = 0x9000
+const DATA: u64 = 0x10000
+const DATA2: u64 = 0x20000
+
+const F_NEXT: u64 = 1
+const F_WRITE: u64 = 2
+
+fn reg(b: virtio.Blk, off: u64) u64 {
+    return b.read(virtio.MMIO_BASE + off, 4)
+}
+
+fn set(inout b: virtio.Blk, mem: kvm.GuestMemory, off: u64, v: u64) void {
+    b.write(mem, virtio.MMIO_BASE + off, 4, v)
+}
+
+fn desc(mem: kvm.GuestMemory, i: u64, addr: u64, len: u64, flags: u64, next: u64) !void {
+    try mem.write_le(DESC + i * 16, 8, addr)
+    try mem.write_le(DESC + i * 16 + 8, 4, len)
+    try mem.write_le(DESC + i * 16 + 12, 2, flags)
+    try mem.write_le(DESC + i * 16 + 14, 2, next)
+}
+
+fn header(mem: kvm.GuestMemory, kind: u64, sector: u64) !void {
+    try mem.write_le(HDR, 4, kind)
+    try mem.write_le(HDR + 4, 4, 0)
+    try mem.write_le(HDR + 8, 8, sector)
+}
+
+// Makes the chain at head available, notifies, and shows what came back.
+fn submit(io: Io, inout b: virtio.Blk, mem: kvm.GuestMemory, what: str, head: u64) !void {
+    try mem.write_le(STATUS, 1, 0xff)
+    const idx = try mem.read_le(AVAIL + 2, 2)
+    try mem.write_le(AVAIL + 4 + 2 * (idx % N), 2, head)
+    try mem.write_le(AVAIL + 2, 2, (idx + 1) & 0xffff)
+    set(&b, mem, 0x050, 0)
+    const used_idx = try mem.read_le(USED + 2, 2)
+    const slot = USED + 4 + 8 * ((used_idx + 0xffff) % N)
+    const id = try mem.read_le(slot, 4)
+    const len = try mem.read_le(slot + 4, 4)
+    const irq = b.take_irq()
+    const isr = reg(b, 0x060)
+    set(&b, mem, 0x064, isr)
+    io.print(what, ": used ", used_idx, " id ", id, " len ", len, ", status ", try mem.read_le(STATUS, 1), ", irq ", irq, " isr ", isr)
+}
+
+fn fill(mem: kvm.GuestMemory, addr: u64, len: u64, v: u64) !void {
+    var i: u64 = 0
+    while (i < len) {
+        try mem.write_le(addr + i, 1, v)
+        i = i + 1
+    }
+}
+
+// A summary of len bytes at addr: the first, the last, and how many equal
+// the first.
+fn show(io: Io, mem: kvm.GuestMemory, what: str, addr: u64, len: u64) !void {
+    const first = try mem.read_le(addr, 1)
+    var same = 0
+    var i: u64 = 0
+    while (i < len) {
+        if (try mem.read_le(addr + i, 1) == first) {
+            same = same + 1
+        }
+        i = i + 1
+    }
+    io.print(what, ": first ", first, ", last ", try mem.read_le(addr + len - 1, 1), ", ", same, " of ", len, " like the first")
+}
+
+// The driver's side of starting the device, as virtio_mmio and
+// virtio_blk do it.
+fn start(io: Io, inout b: virtio.Blk, mem: kvm.GuestMemory) void {
+    set(&b, mem, 0x070, 0)
+    set(&b, mem, 0x070, 1)          // ACKNOWLEDGE
+    set(&b, mem, 0x070, 3)          // DRIVER
+    set(&b, mem, 0x014, 0)
+    const lo = reg(b, 0x010)
+    set(&b, mem, 0x014, 1)
+    const hi = reg(b, 0x010)
+    set(&b, mem, 0x024, 0)
+    set(&b, mem, 0x020, lo)
+    set(&b, mem, 0x024, 1)
+    set(&b, mem, 0x020, hi)
+    set(&b, mem, 0x070, 11)         // FEATURES_OK
+    io.print("features ", hi, ":", lo, ", status after FEATURES_OK ", reg(b, 0x070))
+    set(&b, mem, 0x030, 0)
+    io.print("queue max ", reg(b, 0x034), ", ready ", reg(b, 0x044))
+    set(&b, mem, 0x038, N)
+    set(&b, mem, 0x080, DESC)
+    set(&b, mem, 0x084, 0)
+    set(&b, mem, 0x090, AVAIL)
+    set(&b, mem, 0x094, 0)
+    set(&b, mem, 0x0a0, USED)
+    set(&b, mem, 0x0a4, 0)
+    set(&b, mem, 0x044, 1)
+    set(&b, mem, 0x070, 15)         // DRIVER_OK
+    io.print("ready ", reg(b, 0x044), ", status ", reg(b, 0x070))
+}
+
+fn main(io: Io, a: Allocator) !void {
+    const buf = a.alloc(MEM, @as(u8, 0))
+    defer a.free(buf)
+    const mem = kvm.GuestMemory{ .base = @bufPtr(buf), .gpa = 0, .size = MEM }
+    var b = virtio.Blk.init(try kvm.Disk.temp(a, DISK))
+    defer b.disk.close()
+
+    io.print("magic ", reg(b, 0x000), ", version ", reg(b, 0x004), ", device ", reg(b, 0x008))
+    io.print("capacity ", b.read(virtio.MMIO_BASE + 0x100, 8), " sectors; as two halves ", reg(b, 0x100), " ", reg(b, 0x104), "; one byte ", b.read(virtio.MMIO_BASE + 0x100, 1))
+    io.print("owns 0xc0000fff ", b.owns(0xc0000fff), ", 0xc0001000 ", b.owns(0xc0001000), "; no device ", virtio.Blk.none().owns(0xc0000000))
+
+    // A driver without VERSION_1 is refused.
+    set(&b, mem, 0x070, 3)
+    set(&b, mem, 0x024, 0)
+    set(&b, mem, 0x020, 0x200)
+    set(&b, mem, 0x024, 1)
+    set(&b, mem, 0x020, 0)
+    set(&b, mem, 0x070, 11)
+    io.print("without VERSION_1: status ", reg(b, 0x070))
+    // A queue size that is not a power of 2 does not become ready.
+    set(&b, mem, 0x038, 6)
+    set(&b, mem, 0x044, 1)
+    io.print("queue of 6: ready ", reg(b, 0x044))
+
+    start(io, &b, mem)
+
+    // GET_ID: header, a 20-byte buffer, the status.
+    try header(mem, 8, 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA, 20, F_NEXT | F_WRITE, 2)
+    try desc(mem, 2, STATUS, 1, F_WRITE, 0)
+    try submit(io, &b, mem, "get id", 0)
+    io.print("id ", try mem.read_le(DATA, 8), " ", try mem.read_le(DATA + 8, 8))
+
+    // Write sector 1 with 0xab, as two descriptors of 256 bytes.
+    try fill(mem, DATA, 512, 0xab)
+    try header(mem, 1, 1)
+    try desc(mem, 0, HDR, 16, F_NEXT, 3)
+    try desc(mem, 3, DATA, 256, F_NEXT, 4)
+    try desc(mem, 4, DATA + 256, 256, F_NEXT, 2)
+    try submit(io, &b, mem, "write sector 1", 0)
+
+    // Read sectors 0 to 2 back: zero, 0xab, zero.
+    try fill(mem, DATA2, 1536, 0x11)
+    try header(mem, 0, 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA2, 1536, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "read sectors 0-2", 0)
+    try show(io, mem, "sector 0", DATA2, 512)
+    try show(io, mem, "sector 1", DATA2 + 512, 512)
+    try show(io, mem, "sector 2", DATA2 + 1024, 512)
+
+    // Flush; an unknown type; a read past the end; a read into a
+    // device-readable buffer; a write from a device-writable one.
+    try header(mem, 4, 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 2)
+    try submit(io, &b, mem, "flush", 0)
+    try header(mem, 99, 0)
+    try submit(io, &b, mem, "type 99", 0)
+    try header(mem, 0, 127)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA2, 1024, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "read past the end", 0)
+    try header(mem, 0, 0xffffffffffffffff)
+    try submit(io, &b, mem, "read at sector 2^64-1", 0)
+    try header(mem, 0, 0)
+    try desc(mem, 1, DATA2, 512, F_NEXT, 2)
+    try submit(io, &b, mem, "read into a readable buffer", 0)
+    try header(mem, 1, 0)
+    try desc(mem, 1, DATA, 512, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "write from a writable buffer", 0)
+    // A buffer outside guest memory.
+    try header(mem, 0, 0)
+    try desc(mem, 1, @as(u64, MEM) - 256, 512, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "read past guest memory", 0)
+
+    // Broken chains: a loop, a next out of the queue, no status, a status
+    // the device cannot write, a head out of the queue. Each is answered
+    // and the device goes on.
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA, 512, F_NEXT | F_WRITE, 0)
+    try submit(io, &b, mem, "loop", 0)
+    try desc(mem, 1, DATA, 512, F_NEXT | F_WRITE, 9)
+    try submit(io, &b, mem, "next out of the queue", 0)
+    try desc(mem, 0, HDR, 16, 0, 0)
+    try submit(io, &b, mem, "header alone", 0)
+    try desc(mem, 0, HDR, 16, F_NEXT, 2)
+    try desc(mem, 2, STATUS, 1, 0, 0)
+    try submit(io, &b, mem, "readable status", 0)
+    try desc(mem, 2, STATUS, 1, F_WRITE, 0)
+    try submit(io, &b, mem, "head 8", 8)
+    try header(mem, 4, 0)
+    try submit(io, &b, mem, "flush after", 0)
+
+    // An avail index more than a queue ahead serves nothing.
+    const idx = try mem.read_le(AVAIL + 2, 2)
+    try mem.write_le(AVAIL + 2, 2, (idx + N + 1) & 0xffff)
+    set(&b, mem, 0x050, 0)
+    io.print("avail index 9 ahead: used ", try mem.read_le(USED + 2, 2), ", irq ", b.take_irq())
+
+    // Reset, then started again from nothing.
+    set(&b, mem, 0x070, 0)
+    io.print("after reset: status ", reg(b, 0x070), ", ready ", reg(b, 0x044))
+}

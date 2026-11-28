@@ -1,0 +1,358 @@
+// ACPI tables, as Firecracker writes them for x86_64: the kernel learns of
+// the virtio-mmio device from them (Firecracker's CI kernels have no
+// virtio_mmio.device= on the command line), and of the interrupt
+// controllers, the serial port and the i8042.
+//
+// RSDP at 0xe0000, where the kernel looks; then XSDT, FADT (hardware-
+// reduced ACPI, no VGA), MADT (the local APIC and one IOAPIC) and DSDT,
+// whose AML describes the devices. The tables sit from the EBDA up, in
+// memory the e820 map leaves out.
+uses alloc
+const kvm = @import("kvm.egg")
+const virtio = @import("virtio.egg")
+
+const TABLES_START: u64 = 0x9fc00
+const RSDP_ADDR: u64 = 0xe0000
+const APIC_ADDR: u64 = 0xfee00000
+const IOAPIC_ADDR: u64 = 0xfec00000
+
+const OEM_ID = "EGGVMM"
+const HYPERVISOR_ID = "EGGVMKVM"
+
+const COM1_PORT: u64 = 0x3f8
+const COM1_IRQ: u64 = 4
+const I8042_DATA_PORT: u64 = 0x60
+const I8042_COMMAND_PORT: u64 = 0x64
+const KBD_IRQ: u64 = 1
+
+const SDT_HEADER = 36
+// FADT fields, as offsets in the table.
+const FADT_SIZE = 276
+const FADT_IAPC_BOOT_ARCH = 109
+const FADT_FLAGS = 112
+const FADT_MINOR_VERSION = 131
+const FADT_X_DSDT = 140
+const FADT_HYPERVISOR_ID = 268
+const FADT_F_PWR_BUTTON: u64 = 1 << 4
+const FADT_F_SLP_BUTTON: u64 = 1 << 5
+const FADT_F_HW_REDUCED_ACPI: u64 = 1 << 20
+const IAPC_VGA_NOT_PRESENT: u64 = 1 << 2
+
+// Writes the tables, the DSDT describing the block device when there is
+// one; gives the RSDP's address.
+fn write_tables(mem: kvm.GuestMemory, a: Allocator, with_blk: bool) !u64 {
+    var addr = TABLES_START
+
+    var dsdt = Buf(u8).empty
+    defer a.free(dsdt)
+    header(a, &dsdt, "DSDT", 2, "EGGVDSDT")
+    dsdt_body(a, &dsdt, with_blk)
+    finish(&dsdt)
+    const dsdt_addr = addr
+    try mem.write(addr, dsdt[0..])
+    addr = addr + @as(u64, @len(dsdt))
+
+    var fadt = Buf(u8).empty
+    defer a.free(fadt)
+    header(a, &fadt, "FACP", 6, "EGGVFADT")
+    zeros(a, &fadt, FADT_SIZE - SDT_HEADER)
+    kvm.put_le(&fadt[0..], FADT_IAPC_BOOT_ARCH, 2, IAPC_VGA_NOT_PRESENT)
+    kvm.put_le(&fadt[0..], FADT_FLAGS, 4, FADT_F_HW_REDUCED_ACPI | FADT_F_PWR_BUTTON | FADT_F_SLP_BUTTON)
+    kvm.put_le(&fadt[0..], FADT_MINOR_VERSION, 1, 5)
+    kvm.put_le(&fadt[0..], FADT_X_DSDT, 8, dsdt_addr)
+    var i = 0
+    while (i < 8) {
+        fadt[FADT_HYPERVISOR_ID + i] = HYPERVISOR_ID[i]
+        i = i + 1
+    }
+    finish(&fadt)
+    const fadt_addr = addr
+    try mem.write(addr, fadt[0..])
+    addr = addr + @as(u64, @len(fadt))
+
+    // MADT: the local APIC's address, flags (no 8259s to disable), then
+    // the IOAPIC (GSIs from 0) and the one CPU's local APIC, enabled.
+    var madt = Buf(u8).empty
+    defer a.free(madt)
+    header(a, &madt, "APIC", 6, "EGGVMADT")
+    put(a, &madt, APIC_ADDR, 4)
+    put(a, &madt, 0, 4)
+    put(a, &madt, 1, 1)               // I/O APIC
+    put(a, &madt, 12, 1)
+    put(a, &madt, 0, 1)               // id
+    put(a, &madt, 0, 1)
+    put(a, &madt, IOAPIC_ADDR, 4)
+    put(a, &madt, 0, 4)               // GSI base
+    put(a, &madt, 0, 1)               // processor local APIC
+    put(a, &madt, 8, 1)
+    put(a, &madt, 0, 1)               // processor UID
+    put(a, &madt, 0, 1)               // APIC id
+    put(a, &madt, 1, 4)               // enabled
+    finish(&madt)
+    const madt_addr = addr
+    try mem.write(addr, madt[0..])
+    addr = addr + @as(u64, @len(madt))
+
+    var xsdt = Buf(u8).empty
+    defer a.free(xsdt)
+    header(a, &xsdt, "XSDT", 1, "EGGVXSDT")
+    put(a, &xsdt, fadt_addr, 8)
+    put(a, &xsdt, madt_addr, 8)
+    finish(&xsdt)
+    const xsdt_addr = addr
+    try mem.write(addr, xsdt[0..])
+    addr = addr + @as(u64, @len(xsdt))
+    if (addr > RSDP_ADDR) {
+        return error.AcpiTooBig
+    }
+
+    // RSDP, revision 2: a checksum over its first 20 bytes, and one over
+    // all 36.
+    var rsdp = Buf(u8).empty
+    defer a.free(rsdp)
+    a.append_str(&rsdp, "RSD PTR ")
+    put(a, &rsdp, 0, 1)
+    a.append_str(&rsdp, OEM_ID)
+    put(a, &rsdp, 2, 1)
+    put(a, &rsdp, 0, 4)               // no RSDT
+    put(a, &rsdp, 36, 4)
+    put(a, &rsdp, xsdt_addr, 8)
+    put(a, &rsdp, 0, 4)               // extended checksum, reserved
+    const first = checksum(rsdp[0..20])
+    rsdp[8] = first
+    const all = checksum(rsdp[0..])
+    rsdp[32] = all
+    try mem.write(RSDP_ADDR, rsdp[0..])
+    return RSDP_ADDR
+}
+
+// The DSDT's AML: COM1, the i8042, and the block device.
+fn dsdt_body(a: Allocator, inout out: Buf(u8), with_blk: bool) void {
+    // Device (\_SB.COM1): an 8250 at 0x3f8 on IRQ 4.
+    var com1 = Buf(u8).empty
+    defer a.free(com1)
+    path2(a, &com1, "_SB_", "COM1")
+    name_eisa(a, &com1, "_HID", "PNP0501")
+    name_int(a, &com1, "_UID", 0)
+    name_str(a, &com1, "_DDN", "COM1")
+    var com1_res = Buf(u8).empty
+    defer a.free(com1_res)
+    interrupt(a, &com1_res, COM1_IRQ)
+    io(a, &com1_res, COM1_PORT, 8)
+    name_crs(a, &com1, com1_res)
+    device(a, &out, com1)
+
+    // Device (\_SB.PS2_): the i8042, always present.
+    var ps2 = Buf(u8).empty
+    defer a.free(ps2)
+    path2(a, &ps2, "_SB_", "PS2_")
+    name_eisa(a, &ps2, "_HID", "PNP0303")
+    var sta = Buf(u8).empty
+    defer a.free(sta)
+    a.append_str(&sta, "_STA")
+    put(a, &sta, 0, 1)                // no arguments, not serialized
+    put(a, &sta, 0xa4, 1)             // Return (0x0f)
+    put(a, &sta, 0x0a, 1)
+    put(a, &sta, 0x0f, 1)
+    put(a, &ps2, 0x14, 1)             // MethodOp
+    pkg_length(a, &ps2, @len(sta))
+    a.append_str(&ps2, sta)
+    var ps2_res = Buf(u8).empty
+    defer a.free(ps2_res)
+    io(a, &ps2_res, I8042_DATA_PORT, 1)
+    io(a, &ps2_res, I8042_COMMAND_PORT, 1)
+    interrupt(a, &ps2_res, KBD_IRQ)
+    name_crs(a, &ps2, ps2_res)
+    device(a, &out, ps2)
+
+    if (with_blk) {
+        // Device (V000): virtio-mmio, its registers and its IRQ.
+        var v = Buf(u8).empty
+        defer a.free(v)
+        a.append_str(&v, "V000")
+        name_str(a, &v, "_HID", "LNRO0005")
+        name_int(a, &v, "_UID", 0)
+        a.append_str(&v, "\x08_CCA\x01")      // Name (_CCA, One)
+        var res = Buf(u8).empty
+        defer a.free(res)
+        put(a, &res, 0x86, 1)                 // Memory32Fixed, read/write
+        put(a, &res, 9, 2)
+        put(a, &res, 1, 1)
+        put(a, &res, virtio.MMIO_BASE, 4)
+        put(a, &res, virtio.MMIO_SIZE, 4)
+        interrupt(a, &res, virtio.IRQ)
+        name_crs(a, &v, res)
+        device(a, &out, v)
+    }
+}
+
+// The 36-byte header, its length and checksum left for finish.
+fn header(a: Allocator, inout t: Buf(u8), signature: str, revision: u64, table_id: str) void {
+    a.append_str(&t, signature)
+    put(a, &t, 0, 4)                  // length
+    put(a, &t, revision, 1)
+    put(a, &t, 0, 1)                  // checksum
+    a.append_str(&t, OEM_ID)
+    a.append_str(&t, table_id)
+    put(a, &t, 0, 4)                  // OEM revision
+    a.append_str(&t, "EGG ")          // creator
+    put(a, &t, 1, 4)
+}
+
+fn finish(inout t: Buf(u8)) void {
+    const len = @as(u64, @len(t))
+    kvm.put_le(&t[0..], 4, 4, len)
+    t[9] = 0
+    const sum = checksum(t[0..])
+    t[9] = sum
+}
+
+// What makes the bytes sum to zero.
+fn checksum(b: []u8) u8 {
+    var sum: u64 = 0
+    var i = 0
+    while (i < @len(b)) {
+        sum = sum + @as(u64, b[i])
+        i = i + 1
+    }
+    return @as(u8, (256 - sum % 256) % 256)
+}
+
+fn put(a: Allocator, inout b: Buf(u8), v: u64, n: i64) void {
+    var x = v
+    var i = 0
+    while (i < n) {
+        a.push(&b, @as(u8, x & 0xff))
+        x = x >> 8
+        i = i + 1
+    }
+}
+
+fn zeros(a: Allocator, inout b: Buf(u8), n: i64) void {
+    var i = 0
+    while (i < n) {
+        a.push(&b, 0)
+        i = i + 1
+    }
+}
+
+// AML's PkgLength for len bytes after it, counting its own 1 to 4 bytes.
+fn pkg_length(a: Allocator, inout b: Buf(u8), len: i64) void {
+    var n = 4
+    if (len < 63) {
+        n = 1
+    } else if (len < 4094) {
+        n = 2
+    } else if (len < 1048573) {
+        n = 3
+    }
+    const total = @as(u64, len + n)
+    if (n == 1) {
+        put(a, &b, total, 1)
+        return
+    }
+    put(a, &b, (@as(u64, n - 1) << 6) | (total & 0xf), 1)
+    put(a, &b, total >> 4, n - 1)
+}
+
+// A two-segment name: DualNamePrefix, then the segments.
+fn path2(a: Allocator, inout b: Buf(u8), first: str, second: str) void {
+    put(a, &b, 0x2e, 1)
+    a.append_str(&b, first)
+    a.append_str(&b, second)
+}
+
+// Device (body), where body starts with the device's name.
+fn device(a: Allocator, inout b: Buf(u8), body: Buf(u8)) void {
+    put(a, &b, 0x5b, 1)               // ExtOpPrefix
+    put(a, &b, 0x82, 1)               // DeviceOp
+    pkg_length(a, &b, @len(body))
+    a.append_str(&b, body)
+}
+
+// Name (seg, integer), as Firecracker encodes a u8, u16 or u32.
+fn name_int(a: Allocator, inout b: Buf(u8), seg: str, v: u64) void {
+    put(a, &b, 0x08, 1)
+    a.append_str(&b, seg)
+    if (v <= 0xff) {
+        put(a, &b, 0x0a, 1)
+        put(a, &b, v, 1)
+    } else if (v <= 0xffff) {
+        put(a, &b, 0x0b, 1)
+        put(a, &b, v, 2)
+    } else {
+        put(a, &b, 0x0c, 1)
+        put(a, &b, v, 4)
+    }
+}
+
+fn name_str(a: Allocator, inout b: Buf(u8), seg: str, s: str) void {
+    put(a, &b, 0x08, 1)
+    a.append_str(&b, seg)
+    put(a, &b, 0x0d, 1)
+    a.append_str(&b, s)
+    put(a, &b, 0, 1)
+}
+
+// Name (seg, EISAID ("PNP0501")): three letters in 5 bits each, then
+// four hex digits, as a DWord whose bytes run most significant first.
+fn name_eisa(a: Allocator, inout b: Buf(u8), seg: str, id: str) void {
+    var v = ((@as(u64, id[0]) - 0x40) << 26) | ((@as(u64, id[1]) - 0x40) << 21) | ((@as(u64, id[2]) - 0x40) << 16)
+    var i = 3
+    while (i < 7) {
+        v = v | (hex(id[i]) << @as(u64, (6 - i) * 4))
+        i = i + 1
+    }
+    put(a, &b, 0x08, 1)
+    a.append_str(&b, seg)
+    put(a, &b, 0x0c, 1)
+    put(a, &b, (v >> 24) & 0xff, 1)
+    put(a, &b, (v >> 16) & 0xff, 1)
+    put(a, &b, (v >> 8) & 0xff, 1)
+    put(a, &b, v & 0xff, 1)
+}
+
+fn hex(c: u8) u64 {
+    if (c >= 'a') {
+        return @as(u64, c - 'a' + 10)
+    } else if (c >= 'A') {
+        return @as(u64, c - 'A' + 10)
+    }
+    return @as(u64, c - '0')
+}
+
+// Name (_CRS, ResourceTemplate () { descriptors }): a Buffer of the
+// descriptors and an end tag.
+fn name_crs(a: Allocator, inout b: Buf(u8), descriptors: Buf(u8)) void {
+    var data = Buf(u8).empty
+    defer a.free(data)
+    const size = @len(descriptors) + 2
+    put(a, &data, 0x0a, 1)            // the buffer's size, a ByteConst
+    put(a, &data, @as(u64, size), 1)
+    a.append_str(&data, descriptors)
+    put(a, &data, 0x79, 1)            // EndTag, checksum 0
+    put(a, &data, 0, 1)
+    a.append_str(&b, "\x08_CRS")
+    put(a, &b, 0x11, 1)               // BufferOp
+    pkg_length(a, &b, @len(data))
+    a.append_str(&b, data)
+}
+
+// Extended Interrupt: consumer, edge-triggered, active high, exclusive.
+fn interrupt(a: Allocator, inout b: Buf(u8), irq: u64) void {
+    put(a, &b, 0x89, 1)
+    put(a, &b, 6, 2)
+    put(a, &b, 0x03, 1)
+    put(a, &b, 1, 1)
+    put(a, &b, irq, 4)
+}
+
+// I/O Port, 16-bit decode, at one fixed address.
+fn io(a: Allocator, inout b: Buf(u8), port: u64, len: u64) void {
+    put(a, &b, 0x47, 1)
+    put(a, &b, 1, 1)
+    put(a, &b, port, 2)
+    put(a, &b, port, 2)
+    put(a, &b, 1, 1)
+    put(a, &b, len, 1)
+}

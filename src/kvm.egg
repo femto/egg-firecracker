@@ -24,8 +24,22 @@ extern fn isatty(fd: i32) i32 uses io
 extern fn tcgetattr(fd: i32, t: *u8) i32 uses io
 extern fn tcsetattr(fd: i32, when: i32, t: *u8) i32 uses io
 extern fn _exit(code: i32) void uses io
+// A disk image, read and written straight between the file and guest
+// memory.
+extern fn pread(fd: i32, buf: *u8, n: usize, off: i64) i64 uses fs
+extern fn pwrite(fd: i32, buf: *u8, n: usize, off: i64) i64 uses fs
+extern fn fsync(fd: i32) i32 uses fs
+extern fn flock(fd: i32, op: i32) i32 uses fs
+// For a temporary disk: mkstemp is in <stdlib.h>, which Egg's C includes,
+// with a char * that a *u8 here would clash with.
+extern fn creat(path: *u8, mode: u32) i32 uses fs
+extern fn getpid() i32 uses fs
+extern fn unlink(path: *u8) i32 uses fs
+extern fn ftruncate(fd: i32, len: i64) i32 uses fs
 
 const O_RDWR: i32 = 2
+const LOCK_EX: i32 = 2
+const LOCK_NB: i32 = 4
 const O_CLOEXEC: i32 = 0x80000
 const PROT_RW: i32 = 3
 const MAP_SHARED: i32 = 0x01
@@ -228,6 +242,88 @@ fn exit_now(code: i32) void {
     _exit(code)
 }
 
+// A disk image open for reading and writing, of size bytes.
+const Disk = struct {
+    fd: i32
+    size: u64
+
+    // Locked for this process alone: two guests writing one file system
+    // image would corrupt it.
+    fn open_path(a: Allocator, path: str) !Disk {
+        const fd = try sys(open(a.cstr(path), O_RDWR | O_CLOEXEC))
+        errdefer close_fd(fd)
+        if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+            return error.DiskInUse
+        }
+        const size = lseek(fd, 0, SEEK_END_)
+        if (size < 0) {
+            return error.DiskFailed
+        }
+        return Disk{ .fd = fd, .size = @as(u64, size) }
+    }
+
+    // A disk of size bytes, all zero, in a temporary file already
+    // unlinked: for tests.
+    fn temp(a: Allocator, size: i64) !Disk {
+        var name = a.concat("/tmp/egg-firecracker-disk-", "")
+        a.append_int(&name, getpid())
+        const path = a.cstr(a.leak(name))
+        a.free(name)
+        close_fd(try sys(creat(path, 0x180)))   // 0600
+        const fd = try sys(open(path, O_RDWR | O_CLOEXEC))
+        _ = unlink(path)
+        errdefer close_fd(fd)
+        _ = try sys(ftruncate(fd, size))
+        return Disk{ .fd = fd, .size = @as(u64, size) }
+    }
+
+    fn close(self: Disk) void {
+        close_fd(self.fd)
+    }
+
+    // len bytes of the disk from off into guest memory at addr.
+    fn read_into(self: Disk, mem: GuestMemory, addr: u64, len: i64, off: u64) !void {
+        const start = mem.offset(addr, len)
+        if (start < 0) {
+            return error.OutOfGuestMemory
+        }
+        if (off > self.size or @as(u64, len) > self.size - off) {
+            return error.OutOfDisk
+        }
+        var done = 0
+        while (done < len) {
+            const n = pread(self.fd, @ptrAdd(mem.base, start + done), @as(usize, len - done), @as(i64, off) + done)
+            if (n <= 0) {
+                return error.DiskFailed
+            }
+            done = done + n
+        }
+    }
+
+    // len bytes of guest memory at addr onto the disk from off.
+    fn write_from(self: Disk, mem: GuestMemory, addr: u64, len: i64, off: u64) !void {
+        const start = mem.offset(addr, len)
+        if (start < 0) {
+            return error.OutOfGuestMemory
+        }
+        if (off > self.size or @as(u64, len) > self.size - off) {
+            return error.OutOfDisk
+        }
+        var done = 0
+        while (done < len) {
+            const n = pwrite(self.fd, @ptrAdd(mem.base, start + done), @as(usize, len - done), @as(i64, off) + done)
+            if (n <= 0) {
+                return error.DiskFailed
+            }
+            done = done + n
+        }
+    }
+
+    fn sync(self: Disk) !void {
+        _ = try sys(fsync(self.fd))
+    }
+}
+
 // The whole file at path. Through open and mmap rather than the fs
 // capability: using that makes the generated C include <fcntl.h>, whose
 // open (variadic, const char *) clashes with the extern fn above.
@@ -359,6 +455,35 @@ const GuestMemory = struct {
         var i = 0
         while (i < @len(bytes)) {
             @ptrAdd(self.base, off + i).* = bytes[i]
+            i = i + 1
+        }
+    }
+
+    // n bytes (1 to 8), little-endian, at addr.
+    fn read_le(self: GuestMemory, addr: u64, n: i64) !u64 {
+        const off = self.offset(addr, n)
+        if (off < 0 or n > 8) {
+            return error.OutOfGuestMemory
+        }
+        var v: u64 = 0
+        var i = n - 1
+        while (i >= 0) {
+            v = (v << 8) | @as(u64, @ptrAdd(self.base, off + i).*)
+            i = i - 1
+        }
+        return v
+    }
+
+    fn write_le(self: GuestMemory, addr: u64, n: i64, v: u64) !void {
+        const off = self.offset(addr, n)
+        if (off < 0 or n > 8) {
+            return error.OutOfGuestMemory
+        }
+        var x = v
+        var i = 0
+        while (i < n) {
+            @ptrAdd(self.base, off + i).* = @as(u8, x & 0xff)
+            x = x >> 8
             i = i + 1
         }
     }

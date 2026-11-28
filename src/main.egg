@@ -1,7 +1,9 @@
 // Boots a Linux vmlinux on one vCPU with its console on ttyS0:
 //
-//     firecracker VMLINUX [--initrd FILE] [CMDLINE]
+//     firecracker VMLINUX [--initrd FILE] [--drive FILE] [CMDLINE]
 //
+// --drive attaches a disk image as a virtio block device, /dev/vda; with
+// no CMDLINE, it is the root file system.
 // The interrupt controllers and the PIT are KVM's; this handles the VM
 // exits for the serial port and the i8042 reset that `reboot=k` uses.
 // Standard input goes to the serial port; on a terminal, raw, with ^A x to
@@ -12,9 +14,13 @@ const boot = @import("boot.egg")
 const serial = @import("serial.egg")
 const console = @import("console.egg")
 const input = @import("input.egg")
+const virtio = @import("virtio.egg")
+const acpi = @import("acpi.egg")
 
 const MEM_SIZE = 512 * 1024 * 1024
 const DEFAULT_CMDLINE = "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd"
+const ROOT_CMDLINE = " root=/dev/vda rw"
+const USAGE = "usage: firecracker VMLINUX [--initrd FILE] [--drive FILE] [CMDLINE]"
 
 const I8042_COMMAND = 0x64
 const I8042_RESET: u64 = 0xfe
@@ -22,31 +28,49 @@ const CMOS_DATA = 0x71
 
 fn main(io: Io, args: Args, files: Fs, a: Allocator, clock: Clock, threads: Threads) void {
     if (args.len() < 2) {
-        io.eprint("usage: firecracker VMLINUX [--initrd FILE] [CMDLINE]")
+        io.eprint(USAGE)
         return
     }
     var initrd = ""
-    var cmdline = DEFAULT_CMDLINE
+    var drive = ""
+    var cmdline = ""
     var i = 2
     while (i < args.len()) {
-        if (args.get(i) == "--initrd") {
+        const arg = args.get(i)
+        if (arg == "--initrd" or arg == "--drive") {
             if (i + 1 == args.len()) {
-                io.eprint("usage: firecracker VMLINUX [--initrd FILE] [CMDLINE]")
+                io.eprint(USAGE)
                 return
             }
-            initrd = args.get(i + 1)
+            if (arg == "--initrd") {
+                initrd = args.get(i + 1)
+            } else {
+                drive = args.get(i + 1)
+            }
             i = i + 2
         } else {
-            cmdline = args.get(i)
+            cmdline = arg
             i = i + 1
         }
     }
-    run(io, files, a, clock, threads, args.get(1), initrd, cmdline) catch |e| {
+    var line = Buf(u8).empty
+    if (@len(cmdline) > 0) {
+        a.append_str(&line, cmdline)
+    } else {
+        a.append_str(&line, DEFAULT_CMDLINE)
+        if (@len(drive) > 0) {
+            a.append_str(&line, ROOT_CMDLINE)
+        }
+    }
+    // Kept for the whole run, as the arguments are.
+    const full = a.leak(line)
+    a.free(line)
+    run(io, files, a, clock, threads, args.get(1), initrd, drive, full) catch |e| {
         io.eprint("firecracker: ", @errorName(e))
     }
 }
 
-fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: str, initrd: str, cmdline: str) !void {
+fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: str, initrd: str, drive: str, cmdline: str) !void {
     const start = clock.monotonic()
     const k = try kvm.Kvm.init(a)
     const vm = try k.create_vm()
@@ -66,6 +90,16 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
         io.eprint("[vmm] initrd ", initrd, ": ", initrd_size, " bytes at ", initrd_addr)
     }
     try boot.write_boot_data(mem, a, cmdline, initrd_addr, initrd_size)
+    // The ACPI tables, and the RSDP's address in the zero page's
+    // acpi_rsdp_addr.
+    const rsdp = try acpi.write_tables(mem, a, @len(drive) > 0)
+    try mem.write_le(boot.ZERO_PAGE_START + 0x070, 8, rsdp)
+    var blk = virtio.Blk.none()
+    if (@len(drive) > 0) {
+        blk = virtio.Blk.init(try kvm.Disk.open_path(a, drive))
+        io.eprint("[vmm] drive ", drive, ": ", blk.disk.size, " bytes, /dev/vda")
+    }
+    defer blk.disk.close()
 
     const vcpu = try vm.create_vcpu(0)
     const cpuid = try k.supported_cpuid(a)
@@ -130,7 +164,16 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: 
                 try vm.irq_pulse(a, serial.IRQ)
             }
         } else if (exit.reason == kvm.EXIT_MMIO) {
-            if (!exit.write) {
+            if (blk.owns(exit.addr)) {
+                if (exit.write) {
+                    blk.write(mem, exit.addr, exit.size, exit.data)
+                } else {
+                    try vcpu.complete_read(exit, blk.read(exit.addr, exit.size))
+                }
+                if (blk.take_irq()) {
+                    try vm.irq_pulse(a, virtio.IRQ)
+                }
+            } else if (!exit.write) {
                 try vcpu.complete_read(exit, 0)
             }
         } else if (exit.reason == kvm.EXIT_SYSTEM_EVENT) {
