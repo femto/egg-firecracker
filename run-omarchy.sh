@@ -61,8 +61,9 @@ fi
 if [ "$UBUNTU" = 1 ]; then
     echo "==> preparing the root file system"
     # Copied to a temporary name and renamed when whole, so an interrupted
-    # copy is never booted.
-    ssh -n "$HOST" 'test -f ~/fc/ubuntu-24.04.egg.ext4 || { cp --sparse=always ~/fc/ubuntu-24.04.ext4 ~/fc/ubuntu-24.04.egg.ext4.part && mv ~/fc/ubuntu-24.04.egg.ext4.part ~/fc/ubuntu-24.04.egg.ext4; }'
+    # copy is never booted; under a lock of its own, so two runs started
+    # together copy once (the second finds the image when it gets the lock).
+    ssh -n "$HOST" 'cd ~/fc && flock ubuntu-24.04.egg.ext4.lock sh -c "test -f ubuntu-24.04.egg.ext4 || { cp --sparse=always ubuntu-24.04.ext4 ubuntu-24.04.egg.ext4.part && mv ubuntu-24.04.egg.ext4.part ubuntu-24.04.egg.ext4; }"'
     remote="$remote --drive ~/fc/ubuntu-24.04.egg.ext4"
 fi
 
