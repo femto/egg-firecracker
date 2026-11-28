@@ -35,6 +35,8 @@ fn main(io: Io, args: Args, files: Fs, a: Allocator, threads: Threads) void {
     var initrd = ""
     var drive = ""
     var cmdline = ""
+    // Given, even as "": the defaults are only for no CMDLINE at all.
+    var have_cmdline = false
     var i = 2
     while (i < args.len()) {
         const arg = args.get(i)
@@ -51,11 +53,12 @@ fn main(io: Io, args: Args, files: Fs, a: Allocator, threads: Threads) void {
             i = i + 2
         } else {
             cmdline = arg
+            have_cmdline = true
             i = i + 1
         }
     }
     var line = Buf(u8).empty
-    if (@len(cmdline) > 0) {
+    if (have_cmdline) {
         a.append_str(&line, cmdline)
     } else {
         a.append_str(&line, DEFAULT_CMDLINE)
