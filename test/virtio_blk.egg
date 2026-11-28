@@ -256,6 +256,20 @@ fn main(io: Io, a: Allocator) !void {
     try submit(io, &b, mem, "read sector 5", 0)
     try show(io, mem, "sector 5", DATA2, 512)
 
+    // Values that would overflow: GET_ID with sector 2^64-1 (it has no
+    // disk offset); a writable buffer at 2^64-1, 2 bytes long, whose
+    // status would be past the top of the address space; a data buffer
+    // ending exactly at 2^64.
+    try header(mem, 8, 0xffffffffffffffff)
+    try desc(mem, 0, HDR, 16, F_NEXT, 1)
+    try desc(mem, 1, DATA, 20, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "get id at sector 2^64-1", 0)
+    try header(mem, 0, 0)
+    try desc(mem, 1, 0xffffffffffffffff, 2, F_WRITE, 0)
+    try submit(io, &b, mem, "buffer at 2^64-1", 0)
+    try desc(mem, 1, 0xfffffffffffffe00, 512, F_NEXT | F_WRITE, 2)
+    try submit(io, &b, mem, "buffer ending at 2^64", 0)
+
     // Broken chains: a loop, a next out of the queue, no status, a status
     // the device cannot write, a head out of the queue. Each is answered
     // and the device goes on.

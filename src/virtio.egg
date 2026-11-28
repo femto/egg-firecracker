@@ -72,6 +72,7 @@ const BLK_S_OK: u64 = 0
 const BLK_S_IOERR: u64 = 1
 const BLK_S_UNSUPP: u64 = 2
 const SECTOR_SIZE: u64 = 512
+const U64_MAX: u64 = 0xffffffffffffffff
 const ID = "egg-firecracker"   // at most 20 bytes, VIRTIO_BLK_ID_BYTES
 
 const Blk = struct {
@@ -325,6 +326,12 @@ const Blk = struct {
         while (true) {
             const x = self.desc_at(mem, d)
             count = count + 1
+            // A buffer that would run past the top of the address space:
+            // every offset added to an address below stays within its
+            // buffer, so none of them can overflow.
+            if (x.len > U64_MAX - x.addr) {
+                return 0
+            }
             if (x.flags & DESC_F_WRITE != 0) {
                 writable = writable + x.len
             } else {
@@ -423,7 +430,12 @@ const Blk = struct {
         } else if (kind == T_GET_ID and hi > 20) {
             hi = 20
         }
-        var pos = sector * SECTOR_SIZE
+        // The disk offset, for a read or a write: GET_ID has none, and
+        // its sector is not checked.
+        var pos: u64 = 0
+        if (kind != T_GET_ID) {
+            pos = sector * SECTOR_SIZE
+        }
         var written: u64 = 0
         var start: u64 = 0
         var d = head
