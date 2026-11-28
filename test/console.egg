@@ -26,7 +26,7 @@ fn main(io: Io, a: Allocator) !void {
     page[DATA + 1] = 'B'
     page[DATA + 2] = '\n'
     const vcpu = kvm.Vcpu{ .fd = -1, .run_page = @bufPtr(page), .run_size = PAGE }
-    try console.out(io, a, &uart, &line, vcpu, out_exit(3))
+    try console.out(io, a, &uart, &line, vcpu, out_exit(3), false)
 
     // 4000 bytes, then 96, then 4, with no newline: the line is printed as
     // its 4096th byte arrives (none kept then, not on the 4097th), and the
@@ -36,15 +36,15 @@ fn main(io: Io, a: Allocator) !void {
         @ptrAdd(@bufPtr(page), DATA + i).* = 'x'
         i = i + 1
     }
-    try console.out(io, a, &uart, &line, vcpu, out_exit(4000))
+    try console.out(io, a, &uart, &line, vcpu, out_exit(4000), false)
     io.print("kept ", @len(line))
-    try console.out(io, a, &uart, &line, vcpu, out_exit(96))
+    try console.out(io, a, &uart, &line, vcpu, out_exit(96), false)
     io.print("kept ", @len(line))
-    try console.out(io, a, &uart, &line, vcpu, out_exit(4))
+    try console.out(io, a, &uart, &line, vcpu, out_exit(4), false)
     io.print("kept ", @len(line))
 
     // An exit claiming more elements than kvm_run holds is refused.
-    console.out(io, a, &uart, &line, vcpu, out_exit(PAGE)) catch |e| {
+    console.out(io, a, &uart, &line, vcpu, out_exit(PAGE), false) catch |e| {
         io.print("refused: ", @errorName(e))
     }
 }

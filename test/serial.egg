@@ -1,0 +1,103 @@
+// The UART's transmitter-empty (THRE) interrupt, which the tty driver waits
+// for before each byte user space writes, and its receive side. Needs no
+// KVM.
+uses io
+const serial = @import("firecracker/serial")
+
+const THR = 0x3f8
+const IER = 0x3f9
+const IIR = 0x3fa
+const LCR = 0x3fb
+const MCR = 0x3fc
+const LSR = 0x3fd
+
+fn show(io: Io, inout u: serial.Serial, what: str) void {
+    const irq = u.take_irq()
+    const iir = u.read(IIR)
+    const again = u.read(IIR)
+    io.print(what, ": irq ", irq, ", iir ", iir, " then ", again)
+}
+
+fn main(io: Io) void {
+    var u = serial.Serial.init()
+    _ = u.write(THR, 'x')
+    show(io, &u, "byte, THRE disabled")
+    _ = u.write(IER, 0x02)
+    show(io, &u, "THRE enabled")
+    _ = u.write(IER, 0x02)
+    show(io, &u, "enabled again")
+    io.print("sent ", u.write(THR, 'A'))
+    show(io, &u, "byte")
+    _ = u.write(IER, 0x00)
+    _ = u.write(IER, 0x02)
+    _ = u.write(IER, 0x00)
+    show(io, &u, "raised, then disabled")
+    _ = u.write(MCR, 0x00)
+    _ = u.write(IER, 0x02)
+    show(io, &u, "OUT2 low")
+    _ = u.write(MCR, 0x00)
+    _ = u.write(IER, 0x00)
+    _ = u.write(IER, 0x02)
+    io.print("THRE behind OUT2: irq ", u.take_irq())
+    _ = u.write(MCR, 0x08)
+    show(io, &u, "OUT2 opened")
+    _ = u.write(LCR, 0x83)
+    _ = u.write(THR, 0x0c)
+    show(io, &u, "divisor latch write")
+    _ = u.write(LCR, 0x03)
+
+    // Input waits while the received-data interrupt is disabled.
+    _ = u.write(IER, 0x00)
+    io.print("RDA disabled: room ", u.rx_room())
+    // Received data, with its interrupt disabled: no edge, LSR shows it.
+    _ = u.receive('h')
+    _ = u.receive('i')
+    io.print("received, RDA disabled: irq ", u.take_irq(), ", lsr ", u.read(LSR))
+    // Enabling it with data waiting raises it; IIR reports it, and keeps
+    // reporting it until the data is read.
+    _ = u.write(IER, 0x03)
+    io.print("RDA enabled: irq ", u.take_irq(), ", iir ", u.read(IIR), " then ", u.read(IIR))
+    const h = u.read(THR)
+    const i = u.read(THR)
+    io.print("read ", h, " ", i, ", then ", u.read(THR), "; lsr ", u.read(LSR))
+    // The data read, THRE (raised with the enable) is next, once.
+    show(io, &u, "after the data")
+    _ = u.receive('!')
+    io.print("one more: irq ", u.take_irq())
+    _ = u.read(THR)
+    // Received data behind a closed OUT2 raises the line when it opens.
+    _ = u.write(MCR, 0x00)
+    _ = u.receive('?')
+    io.print("data behind OUT2: irq ", u.take_irq())
+    _ = u.write(MCR, 0x08)
+    io.print("OUT2 opened: irq ", u.take_irq(), ", iir ", u.read(IIR))
+    _ = u.read(THR)
+    // Enabling only the received-data interrupt, with the FIFO empty,
+    // sends an edge: input may be waiting outside it.
+    _ = u.write(IER, 0x00)
+    _ = u.write(IER, 0x01)
+    io.print("RDA alone, FIFO empty: irq ", u.take_irq())
+    _ = u.write(IER, 0x03)
+    _ = u.take_irq()
+    // Enabled behind a closed OUT2, it raises the line when OUT2 opens.
+    _ = u.write(MCR, 0x00)
+    _ = u.write(IER, 0x00)
+    _ = u.write(IER, 0x01)
+    io.print("RDA enabled behind OUT2: irq ", u.take_irq())
+    _ = u.write(MCR, 0x08)
+    io.print("OUT2 opened, FIFO empty: irq ", u.take_irq())
+    _ = u.write(IER, 0x03)
+    _ = u.take_irq()
+    // Input comes in on reads of RBR, IIR and LSR, not IER (which the
+    // kernel's probe writes and reads back), nor the divisor latch.
+    io.print("takes input: rbr ", u.reads_rx(THR), ", iir ", u.reads_rx(IIR), ", lsr ", u.reads_rx(LSR), ", ier ", u.reads_rx(IER))
+    _ = u.write(LCR, 0x83)
+    io.print("with DLAB: rbr ", u.reads_rx(THR))
+    _ = u.write(LCR, 0x03)
+    // The FIFO holds 64.
+    var n = 0
+    while (u.receive('z')) {
+        n = n + 1
+    }
+    io.print("FIFO took ", n, ", room ", u.rx_room())
+}

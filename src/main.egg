@@ -1,14 +1,17 @@
 // Boots a Linux vmlinux on one vCPU with its console on ttyS0:
 //
-//     firecracker VMLINUX [CMDLINE]
+//     firecracker VMLINUX [--initrd FILE] [CMDLINE]
 //
 // The interrupt controllers and the PIT are KVM's; this handles the VM
 // exits for the serial port and the i8042 reset that `reboot=k` uses.
-uses io, args, fs, alloc, time
+// Standard input goes to the serial port; on a terminal, raw, with ^A x to
+// stop.
+uses io, args, fs, alloc, time, thread
 const kvm = @import("kvm.egg")
 const boot = @import("boot.egg")
 const serial = @import("serial.egg")
 const console = @import("console.egg")
+const input = @import("input.egg")
 
 const MEM_SIZE = 512 * 1024 * 1024
 const DEFAULT_CMDLINE = "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd"
@@ -17,21 +20,33 @@ const I8042_COMMAND = 0x64
 const I8042_RESET: u64 = 0xfe
 const CMOS_DATA = 0x71
 
-fn main(io: Io, args: Args, files: Fs, a: Allocator, clock: Clock) void {
+fn main(io: Io, args: Args, files: Fs, a: Allocator, clock: Clock, threads: Threads) void {
     if (args.len() < 2) {
-        io.eprint("usage: firecracker VMLINUX [CMDLINE]")
+        io.eprint("usage: firecracker VMLINUX [--initrd FILE] [CMDLINE]")
         return
     }
+    var initrd = ""
     var cmdline = DEFAULT_CMDLINE
-    if (args.len() > 2) {
-        cmdline = args.get(2)
+    var i = 2
+    while (i < args.len()) {
+        if (args.get(i) == "--initrd") {
+            if (i + 1 == args.len()) {
+                io.eprint("usage: firecracker VMLINUX [--initrd FILE] [CMDLINE]")
+                return
+            }
+            initrd = args.get(i + 1)
+            i = i + 2
+        } else {
+            cmdline = args.get(i)
+            i = i + 1
+        }
     }
-    run(io, files, a, clock, args.get(1), cmdline) catch |e| {
+    run(io, files, a, clock, threads, args.get(1), initrd, cmdline) catch |e| {
         io.eprint("firecracker: ", @errorName(e))
     }
 }
 
-fn run(io: Io, files: Fs, a: Allocator, clock: Clock, kernel: str, cmdline: str) !void {
+fn run(io: Io, files: Fs, a: Allocator, clock: Clock, threads: Threads, kernel: str, initrd: str, cmdline: str) !void {
     const start = clock.monotonic()
     const k = try kvm.Kvm.init(a)
     const vm = try k.create_vm()
@@ -40,8 +55,17 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, kernel: str, cmdline: str)
 
     const image = try kvm.read_file(a, kernel)
     defer a.free(image)
-    const entry = try boot.load_elf(mem, image[0..])
-    try boot.write_boot_data(mem, a, cmdline)
+    const loaded = try boot.load_elf(mem, image[0..])
+    var initrd_addr: u64 = 0
+    var initrd_size: u64 = 0
+    if (@len(initrd) > 0) {
+        const ramdisk = try kvm.read_file(a, initrd)
+        defer a.free(ramdisk)
+        initrd_addr = try boot.load_initrd(mem, loaded, ramdisk[0..])
+        initrd_size = @as(u64, @len(ramdisk))
+        io.eprint("[vmm] initrd ", initrd, ": ", initrd_size, " bytes at ", initrd_addr)
+    }
+    try boot.write_boot_data(mem, a, cmdline, initrd_addr, initrd_size)
 
     const vcpu = try vm.create_vcpu(0)
     const cpuid = try k.supported_cpuid(a)
@@ -53,12 +77,25 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, kernel: str, cmdline: str)
     try vcpu.set_sregs(sregs)
     var regs = a.alloc(kvm.REGS_SIZE, @as(u8, 0))
     defer a.free(regs)
-    boot.configure_regs(&regs[0..], entry)
+    boot.configure_regs(&regs[0..], loaded.entry)
     try vcpu.set_regs(regs)
     try vcpu.init_fpu(a)
     try vcpu.init_lapic(a)
-    io.eprint("[vmm] kernel ", kernel, ": ", @len(image), " bytes, entry ", entry, ", ", MEM_SIZE / 1024 / 1024, " MiB")
+    io.eprint("[vmm] kernel ", kernel, ": ", @len(image), " bytes, entry ", loaded.entry, ", ", MEM_SIZE / 1024 / 1024, " MiB")
     io.eprint("[vmm] cmdline: ", cmdline)
+
+    // The input thread keeps its own copy of the terminal's settings, to
+    // put back when ^A x ends the process under this thread.
+    const saved = try kvm.raw_stdin(a)
+    defer a.free(saved)
+    defer kvm.restore_stdin(saved)
+    const live = @len(saved) > 0
+    const rx = threads.channel(u8, 4096)
+    defer rx.close()
+    threads.spawn(input.run, rx.sender(), io, a, vm, a.concat(saved, "")).detach()
+    if (live) {
+        io.eprint("[vmm] the console takes the keyboard: ^A x stops")
+    }
 
     var uart = serial.Serial.init()
     var line = Buf(u8).empty
@@ -69,7 +106,10 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, kernel: str, cmdline: str)
         exits = exits + 1
         if (exit.reason == kvm.EXIT_IO and exit.write) {
             if (serial.Serial.owns(exit.port)) {
-                try console.out(io, a, &uart, &line, vcpu, exit)
+                try console.out(io, a, &uart, &line, vcpu, exit, live)
+                if (uart.take_irq()) {
+                    try vm.irq_pulse(a, serial.IRQ)
+                }
             } else if (exit.port == I8042_COMMAND and exit.data == I8042_RESET) {
                 done(io, a, &line, clock, start, exits, "the guest reset the machine (i8042)")
                 return
@@ -77,12 +117,18 @@ fn run(io: Io, files: Fs, a: Allocator, clock: Clock, kernel: str, cmdline: str)
         } else if (exit.reason == kvm.EXIT_IO) {
             var v: u64 = 0
             if (serial.Serial.owns(exit.port)) {
+                if (uart.reads_rx(exit.port)) {
+                    input.drain(rx, &uart)
+                }
                 v = @as(u64, uart.read(exit.port))
             } else if (exit.port != I8042_COMMAND and exit.port != CMOS_DATA) {
                 // Nothing here: the bus floats high.
                 v = 0xffffffff
             }
             try vcpu.complete_read(exit, v)
+            if (uart.take_irq()) {
+                try vm.irq_pulse(a, serial.IRQ)
+            }
         } else if (exit.reason == kvm.EXIT_MMIO) {
             if (!exit.write) {
                 try vcpu.complete_read(exit, 0)

@@ -1,5 +1,6 @@
 // The serial console: what the guest writes to ttyS0, printed a line at a
-// time.
+// time, or, live on a terminal, as it comes: a shell's prompt and the echo
+// of what is typed have no newline.
 uses io, alloc
 const kvm = @import("kvm.egg")
 const serial = @import("serial.egg")
@@ -10,12 +11,21 @@ const MAX_LINE = 4096
 
 // An out to the UART: every one of its count elements, which a string out
 // (rep outsb) can carry in one exit.
-fn out(io: Io, a: Allocator, inout uart: serial.Serial, inout line: Buf(u8), vcpu: kvm.Vcpu, exit: kvm.Exit) !void {
+fn out(io: Io, a: Allocator, inout uart: serial.Serial, inout line: Buf(u8), vcpu: kvm.Vcpu, exit: kvm.Exit, live: bool) !void {
     var i = 0
     while (i < exit.count) {
         const v = try vcpu.out_value(exit, i)
-        put(io, a, &line, uart.write(exit.port, @as(u8, v & 0xff)))
+        const c = uart.write(exit.port, @as(u8, v & 0xff))
+        if (!live) {
+            put(io, a, &line, c)
+        } else if (c >= 0) {
+            a.push(&line, @as(u8, c))
+        }
         i = i + 1
+    }
+    if (live and @len(line) > 0) {
+        kvm.write_stdout(line)
+        a.resize(&line, 0, 0)
     }
 }
 

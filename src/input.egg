@@ -1,0 +1,62 @@
+// Standard input to the guest's serial port. A thread of its own reads it,
+// as the vCPU thread spends its time inside KVM_RUN, and sends the bytes
+// over a channel; the vCPU thread moves them into the UART's FIFO when the
+// guest next reads RBR, IIR or LSR. An edge on the UART's IRQ makes it do so,
+// waking a guest that is idle without leaving KVM_RUN.
+//
+// ^A x ends the VMM, as in QEMU; ^A ^A sends one ^A.
+// fs: KVM_IRQ_LINE, as kvm.egg declares ioctl.
+uses io, alloc, thread, fs
+const kvm = @import("kvm.egg")
+const serial = @import("serial.egg")
+
+const CTRL_A: u8 = 0x01
+
+fn run(sink tx: Sender(u8), io: Io, a: Allocator, vm: kvm.Vm, sink saved: Buf(u8)) void {
+    defer tx.close()
+    defer a.free(saved)
+    const b = a.alloc(64, @as(u8, 0))
+    defer a.free(b)
+    var escape = false
+    while (true) {
+        const n = kvm.read_stdin(b)
+        if (n <= 0) {
+            return
+        }
+        var i = 0
+        while (i < n) {
+            const c = b[i]
+            if (escape) {
+                escape = false
+                if (c == 'x') {
+                    kvm.restore_stdin(saved)
+                    io.eprint("\n[vmm] ^A x: stopped")
+                    kvm.exit_now(0)
+                } else if (c == CTRL_A) {
+                    tx.send(c)
+                }
+            } else if (c == CTRL_A) {
+                escape = true
+            } else {
+                tx.send(c)
+            }
+            i = i + 1
+        }
+        vm.irq_pulse(a, serial.IRQ) catch {
+            return
+        }
+    }
+}
+
+// Moves what has arrived into the UART, as much as its FIFO takes; none
+// while the guest has the received-data interrupt disabled.
+fn drain(rx: Receiver(u8), inout uart: serial.Serial) void {
+    while (uart.rx_room() > 0) {
+        const got = rx.recv_timeout(0)
+        if (got) |c| {
+            _ = uart.receive(c)
+        } else {
+            return
+        }
+    }
+}

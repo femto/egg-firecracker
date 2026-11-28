@@ -1,0 +1,24 @@
+byte, THRE disabled: irq false, iir 1 then 1
+THRE enabled: irq true, iir 2 then 1
+enabled again: irq false, iir 1 then 1
+sent 65
+byte: irq true, iir 2 then 1
+raised, then disabled: irq false, iir 1 then 1
+OUT2 low: irq false, iir 2 then 1
+THRE behind OUT2: irq false
+OUT2 opened: irq true, iir 2 then 1
+divisor latch write: irq false, iir 1 then 1
+RDA disabled: room 0
+received, RDA disabled: irq false, lsr 97
+RDA enabled: irq true, iir 4 then 4
+read 104 105, then 0; lsr 96
+after the data: irq false, iir 2 then 1
+one more: irq true
+data behind OUT2: irq false
+OUT2 opened: irq true, iir 4
+RDA alone, FIFO empty: irq true
+RDA enabled behind OUT2: irq false
+OUT2 opened, FIFO empty: irq true
+takes input: rbr true, iir true, lsr true, ier false
+with DLAB: rbr false
+FIFO took 64, room 0
